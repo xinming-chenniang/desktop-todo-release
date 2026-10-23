@@ -9,7 +9,7 @@
 
 - 安装包（推荐）：[desktop-todo_0.2.2_all.deb](desktop-todo_0.2.2_all.deb)（72K）
 - 源码：[desktop_todo.py](desktop_todo.py)（单文件，`python3 desktop_todo.py` 直接运行）
-- 校验：`91ad67263ff14d3a7e7b8ba2dfbfdc17634d9550b56221737d1cd67348761e52`（SHA256，`.deb` 与源码包各一份，见 `SHA256SUMS`）
+- 校验：`92eba2a9c446d173563846656c8f2dc0174e86bfe5bde0bd544858e1952bc373`（SHA256，记录在 `SHA256SUMS`）
 
 ## 安装（三步）
 
