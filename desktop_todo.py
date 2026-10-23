@@ -4680,26 +4680,26 @@ def run_check():
             tg = Store(os.path.join(temp_dir, "tags.json"))
             if Store.parse_tags("写周报") != ("写周报", []):
                 problems.append("没标签的文字不该被改动")
-            if Store.parse_tags("给彭老师打电话 @电话 @外出") != ("给彭老师打电话",
+            if Store.parse_tags("给张老师打电话 @电话 @外出") != ("给张老师打电话",
                                                               ["电话", "外出"]):
                 problems.append("@ 解析不对: %r"
-                                % (Store.parse_tags("给彭老师打电话 @电话 @外出"),))
+                                % (Store.parse_tags("给张老师打电话 @电话 @外出"),))
             t2_text, t2_tags = Store.parse_tags("@电话 交资料 @电话 @家 @单位 @超出的")
             if t2_tags != ["电话", "家", "单位"] or "@超出的" not in t2_text:
                 problems.append("标签去重/上限不对: %r" % ((t2_text, t2_tags),))
             t3_text, t3_tags = Store.parse_tags("邮箱@qq.com 和 a.com/x@y")
             if t3_tags or "@qq.com" not in t3_text:
                 problems.append("邮箱/网址不该被当成标签: %r" % ((t3_text, t3_tags),))
-            ti = tg.add("催白内障补贴 @电话")
-            if ti["text"] != "催白内障补贴" or Store.tags_of(ti) != ["电话"]:
+            ti = tg.add("整理会议纪要 @电话")
+            if ti["text"] != "整理会议纪要" or Store.tags_of(ti) != ["电话"]:
                 problems.append("add 没有把 @标签 摘进 tags: %r" % (ti,))
-            tg.rename(ti["id"], "催白内障补贴 @电话 @外出")
+            tg.rename(ti["id"], "整理会议纪要 @电话 @外出")
             if Store.tags_of(ti) != ["电话", "外出"]:
                 problems.append("rename 没有更新标签: %r" % (Store.tags_of(ti),))
-            tg.rename(ti["id"], "催白内障补贴")
+            tg.rename(ti["id"], "整理会议纪要")
             if Store.tags_of(ti) != []:
                 problems.append("删掉 @标签 后 tags 应当为空: %r" % (Store.tags_of(ti),))
-            tg.rename(ti["id"], "催白内障补贴 @电话")
+            tg.rename(ti["id"], "整理会议纪要 @电话")
             tg.add("买菜 @外出")
             if sorted(tg.all_tags()) != ["外出", "电话"]:
                 problems.append("all_tags 不对: %r" % (tg.all_tags(),))
