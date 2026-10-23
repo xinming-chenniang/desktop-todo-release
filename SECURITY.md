@@ -1,7 +1,7 @@
 # 安全说明（给用户与信息中心的一页纸）
 
-> desktop-todo v0.2.2 · MIT 许可 · 个人开源项目
-> 源码：<https://github.com/xinming-chenniang/desktop-todo>
+> desktop-todo v0.2.3 · MIT 许可 · 个人开源项目
+> 源码：<https://gitee.com/xinming-chenniang/desktop-todo>（镜像：<https://github.com/xinming-chenniang/desktop-todo-release>）
 
 ## 它做什么
 
@@ -67,4 +67,4 @@ pkill -f desktop_todo.py                            # 结束进程
 ## 报告问题
 
 安全相关问题请开 issue（不要贴真实待办内容）：
-<https://github.com/xinming-chenniang/desktop-todo/issues>
+<https://gitee.com/xinming-chenniang/desktop-todo/issues>

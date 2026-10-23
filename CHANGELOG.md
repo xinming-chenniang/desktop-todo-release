@@ -1,5 +1,14 @@
 # 变更记录
 
+## v0.2.3 — 2026-10-23
+
+发布元数据修正（公开可见的那部分）。
+
+- `.deb` 的 Maintainer 从个人邮箱改为 GitHub 账号
+  `xinming-chenniang <xinming-chenniang@users.noreply.github.com>`；Homepage 指向 Gitee 发布仓。
+- `SECURITY.md` / `README.md` 的链接从开发仓改为公开的发布仓（开发仓是私有的，公开后点开是 404）。
+- 自检里的示例待办换成中性文案（源码在公开仓里可见）。
+
 ## v0.2.2 — 2026-10-23
 
 按**统信/deepin 应用商店规范**重新出包，并准备商店素材。应用行为与 v0.2.1 相同。

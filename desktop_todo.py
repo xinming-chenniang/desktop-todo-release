@@ -61,7 +61,7 @@ except ImportError:            # 没装 python3-tk 时，--doctor / --data-file 
 APP_ID = "desktop-todo"
 # 商店规范要求倒置域名做包名；窗口类名/数据目录仍用 APP_ID，避免老用户数据搬家
 APP_STORE_ID = "com.github.xinming-chenniang.desktoptodo"
-APP_VERSION = "0.2.2"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
+APP_VERSION = "0.2.3"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
 
 
 class _XClientMessageEvent(ctypes.Structure):

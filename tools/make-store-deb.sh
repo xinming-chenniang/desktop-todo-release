@@ -103,8 +103,8 @@ Priority: optional
 Architecture: $ARCH
 Depends: python3 (>= 3.7), python3-tk, libx11-6
 Installed-Size: $SIZE
-Maintainer: YanH <284022719@qq.com>
-Homepage: https://github.com/xinming-chenniang/desktop-todo
+Maintainer: xinming-chenniang <xinming-chenniang@users.noreply.github.com>
+Homepage: https://gitee.com/xinming-chenniang/desktop-todo
 Description: $APP_NAME —— 常驻桌面的待办清单挂件
  常驻桌面右上角的待办清单：无标题栏、可拖动、回车即记，支持三态（未完成 /
  等待中 / 已完成）、子步骤、优先级、情境标签与到点提醒。
