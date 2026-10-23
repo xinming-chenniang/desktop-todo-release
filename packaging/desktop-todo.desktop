@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=桌面待办
+Name[zh_CN]=桌面待办
+GenericName=待办清单
+GenericName[zh_CN]=待办清单
+Comment=常驻桌面的待办清单挂件
+Comment[zh_CN]=常驻桌面的待办清单挂件
+Exec=desktop-todo
+Icon=desktop-todo
+Terminal=false
+Categories=Utility;
+StartupWMClass=desktop-todo
+X-Deepin-AppID=desktop-todo
+Keywords=待办;清单;todo;task;便签;
