@@ -7,20 +7,20 @@
 
 ## 下载
 
-- 安装包（推荐）：[下载 desktop-todo_0.2.2_all.deb](https://gitee.com/xinming-chenniang/desktop-todo/raw/main/desktop-todo_0.2.2_all.deb)（约 68 KB）
-- 源码：本仓库的 `desktop_todo.py`（单文件，直接用 `python3 desktop_todo.py` 运行）
-- 校验：`0adb34f81ef1a6a746eeade9a0a89b58ec0d6bb73a51d353e3122518a3d117ab`（SHA256）
+- 安装包（推荐）：[desktop-todo_0.2.2_all.deb](desktop-todo_0.2.2_all.deb)（72K）
+- 源码：[desktop_todo.py](desktop_todo.py)（单文件，`python3 desktop_todo.py` 直接运行）
+- 校验：`91ad67263ff14d3a7e7b8ba2dfbfdc17634d9550b56221737d1cd67348761e52`（SHA256，`.deb` 与源码包各一份，见 `SHA256SUMS`）
 
 ## 安装（三步）
 
-1. 下载 `desktop-todo_0.2.2_all.deb`
+1. 下载本仓库根目录的 `desktop-todo_0.2.2_all.deb`
 2. **双击**，按提示输入密码安装
 3. 打开**启动器**，搜「桌面待办」
 
 装完右键标题栏可以勾「开机自启」。卸载：`sudo dpkg -r desktop-todo`（**数据不会被删**，
 想彻底清掉再删 `~/.local/share/desktop-todo/`）。
 
-> 安装包没有代码签名，系统可能提示「来源未知」——这是正常的，对照 `SHA256SUMS` 核对即可。
+> 安装包没有代码签名，系统可能提示「来源未知」——这是正常的，对照上面的 SHA256 核对即可。
 
 ## 功能
 
@@ -53,3 +53,5 @@ sha256sum desktop_todo.py
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
+
+> 本仓库由开发仓自动发布；同一份内容同时镜像在 GitHub 与 Gitee。
