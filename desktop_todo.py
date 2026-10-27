@@ -61,7 +61,7 @@ except ImportError:            # 没装 python3-tk 时，--doctor / --data-file 
 APP_ID = "desktop-todo"
 # 商店规范要求倒置域名做包名；窗口类名/数据目录仍用 APP_ID，避免老用户数据搬家
 APP_STORE_ID = "com.github.xinming-chenniang.desktoptodo"
-APP_VERSION = "0.2.3"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
+APP_VERSION = "0.2.6"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
 
 
 class _XClientMessageEvent(ctypes.Structure):
@@ -127,7 +127,8 @@ C_DANGER = "#e5695f"   # 删除悬停
 C_HOVER = "#2e333a"    # 拖动中的条目底色
 C_DONE = "#7b828c"     # 已完成文字
 C_WAIT = "#e0a33e"     # 等待中文字 / 图标
-C_HIGH = "#ff7a59"     # 高优先级旗子
+C_HIGH = "#ff7a59"     # 高优先级：橙红（整行竖条）
+C_MID = "#e6b93f"      # 中优先级：金黄（半行竖条，和高区分开）
 
 PLACEHOLDER = "添加一条待办，回车确认"
 FONT_STACK = (
@@ -1327,27 +1328,67 @@ class Store(object):
             return state
         return STATE_DONE if item.get("done") else STATE_TODO
 
-    def resort(self, save=False):
-        """按状态分组排序（未完成 → 等待中 → 已完成），返回顺序是否真的变了。
+    def _bucket_rank(self, item):
+        """段内的分组键：先「今天要办的」，再优先级（已完成的不参与今天置顶）。"""
+        state = self.state_of(item)
+        today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
+        return (today_rank, -self.priority_of(item))
 
-        用稳定排序：同一组里的相对顺序原样保留，所以「拖拽排出来的优先级」不会被它打乱，
-        它只负责把三段归位。列表顺序变了才会写盘。
+    def resort(self, save=False):
+        """按**状态**分段归位（未完成 → 等待中 → 已完成），返回顺序是否真的变了。
+
+        A 方案（2026-10-26 YanH 定）：段内**手动顺序优先**，不再每次归位都按
+        「今天 / 优先级」重排 —— 否则用户把某条拖到别的分组里，下一次归位就被弹回去，
+        看起来就像"被那条挡住了"。
+        改「今天 / 优先级」时用 place_in_bucket() 把那一条插到对应组的最前面。
+        列表顺序变了才会写盘。
         """
         rank = dict((state, index) for index, state in enumerate(STATE_ORDER))
 
         def sort_key(pair):
             index, item = pair
-            state = self.state_of(item)
-            state_rank = rank.get(state, len(STATE_ORDER))
-            # 段内：先「今天要办的」（已完成的不参与置顶），再优先级，最后是原来的手动顺序
-            today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
-            priority_rank = -self.priority_of(item)
-            return (state_rank, today_rank, priority_rank, index)
+            return (rank.get(self.state_of(item), len(STATE_ORDER)), index)
 
         before = [item["id"] for item in self.items]
         order = sorted(enumerate(self.items), key=sort_key)
         self.items = [item for _, item in order]
         changed = [item["id"] for item in self.items] != before
+        if changed and save:
+            self.save()
+        return changed
+
+    def place_in_bucket(self, item_id, save=True):
+        """把一条插到它所属组（今天 / 优先级）的最前面；同组内保持手动顺序。
+
+        只在「改优先级 / 改今天」时调用。没有这一步的话，A 方案下改优先级不会有任何
+        位置变化（resort 只按状态分段），"高优先级浮到前面"就失效了。
+        """
+        item = None
+        for candidate in self.items:
+            if candidate["id"] == item_id:
+                item = candidate
+                break
+        if item is None:
+            return False
+        state = self.state_of(item)
+        key = self._bucket_rank(item)
+        before = [entry["id"] for entry in self.items]
+        self.items.remove(item)
+        target = None
+        for index, other in enumerate(self.items):
+            if self.state_of(other) != state:
+                continue
+            if self._bucket_rank(other) >= key:
+                target = index
+                break
+        if target is None:
+            last = None
+            for index, other in enumerate(self.items):
+                if self.state_of(other) == state:
+                    last = index
+            target = 0 if last is None else last + 1
+        self.items.insert(target, item)
+        changed = [entry["id"] for entry in self.items] != before
         if changed and save:
             self.save()
         return changed
@@ -1588,6 +1629,9 @@ class TodoWidget(object):
     def _apply_resize(self):
         """按窗口现在的尺寸重排列宽与列表高度；没变化就不重画（避免来回震荡）。"""
         self._size_job = None
+        if self.store.ui["collapsed"]:
+            # 折叠时窗口矮是它该有的样子，别当成"用户把窗口拉小了"
+            return
         if self._steps_edit is not None:
             # 子步骤编辑器会临时把这一行（和窗口）撑高；那是它自己的动作，
             # 不是用户改了窗口大小。这里若照常处理会触发 _refresh()，把编辑框连内容一起销毁。
@@ -1637,6 +1681,9 @@ class TodoWidget(object):
         self.header_h = self.icon_box = self.check_box = 0
         self._size_job = None             # 尺寸变化的重排任务（防抖）
         self._user_sized = False          # 用户手动改过大小：之后不再把它缩回去
+        self._expanded_size = None        # 折叠前的窗口尺寸（展开时还原）
+        self._alpha_dialog = None         # 窗口透明度滑块对话框（开着就复用）
+        self._edit_open_serial = None     # 打开编辑器的那一次点击（同一事件别再当"点别处"）
         self._apply_metrics(store.ui.get("width"))
         self.fonts = self._make_fonts()
         self._drag_offset = None          # 拖窗口的偏移
@@ -1645,6 +1692,8 @@ class TodoWidget(object):
         self.row_widgets = []             # [(item_id, row_canvas)]，按显示顺序
         self._press = None                # 按下时记录 {id, y_root, zone}
         self._drag_id = None              # 正在被拖动的条目 id
+        self._drag_target = None          # 拖动中准备落到第几个位置（松手才真挪）
+        self._drop_line = None            # 拖动中的落点标记线（盖在列表上的小横线）
         self._pointer_y = None            # 拖动中指针的屏幕 y（用于贴边自动滚动）
         self._autoscroll_job = None
         # 撤销与编辑状态
@@ -1778,6 +1827,9 @@ class TodoWidget(object):
         # 就是"先弹出来、紧接着被同一事件的全局处理收掉"——实测菜单根本弹不出来。
         # （右键点别的条目由 _popup_row_menu 自己先收起上一个。）
         self.root.bind_all("<Button-1>", self._dismiss_row_menu, add="+")
+        # 点编辑框以外的任何地方 = 结束编辑并保存（Canvas 默认不抢键盘焦点，
+        # 光靠输入框的 <FocusOut> 点别处是不触发的 —— 结果就是"点别的条目也退不出去"）
+        self.root.bind_all("<Button-1>", self._on_global_click, add="+")
         self._archived_day = None
         self._archive_on_start()
 
@@ -1865,6 +1917,7 @@ class TodoWidget(object):
                               relief="flat", bd=0, font=self.fonts["base"], highlightthickness=0)
         self.entry.pack(side="left", fill="x", expand=True, padx=self.px(8), pady=self.px(5))
         self.entry.bind("<Return>", lambda event: self.add_from_entry())
+        self.entry.bind("<KP_Enter>", lambda event: self.add_from_entry())   # 小键盘回车
         self.entry.bind("<Escape>", lambda event: self.entry.delete(0, "end"))
         self.entry.bind("<FocusIn>", lambda event: self._clear_placeholder())
         self.entry.bind("<FocusOut>", lambda event: self._set_placeholder())
@@ -1924,13 +1977,7 @@ class TodoWidget(object):
         self._autostart_var = tk.BooleanVar(value=os.path.exists(autostart_path()))
         menu.add_checkbutton(label="开机自启", variable=self._autostart_var,
                              command=self._toggle_autostart)
-        self._alpha_var = tk.DoubleVar(value=float(self.store.ui["alpha"]))
-        alpha_menu = tk.Menu(menu, tearoff=0)
-        for label, value in (("完全不透明", 1.0), ("半透明 92%", 0.92),
-                             ("更透明 82%", 0.82), ("最透明 70%", 0.70)):
-            alpha_menu.add_radiobutton(label=label, variable=self._alpha_var,
-                                       value=value, command=self._apply_alpha)
-        menu.add_cascade(label="窗口透明度", menu=alpha_menu)
+        menu.add_command(label="窗口透明度…", command=self.open_alpha_dialog)
         menu.add_separator()
         menu.add_command(label="查看归档…", command=self.open_archive)
         menu.add_separator()
@@ -2097,9 +2144,9 @@ class TodoWidget(object):
         """把一条待办画进行画布（新建与原地重画共用）。
 
         视觉上的几个维度：
-          状态：未完成＝白字空方框；等待中＝琥珀字 + 琥珀小钟；已完成＝灰字删除线 + 蓝勾；
-          优先级：右侧旗子（实心橙＝高、空心橙＝中、淡灰＝无）；
-          今天：右侧「今」（蓝色＝今天要办的）；
+          状态：未完成＝白字空方框；等待中＝琥珀字；已完成＝灰字删除线 + 蓝勾；
+          优先级：行最左侧竖条（橙红＝高、金黄＝中；高＝整行、中＝半行）；
+          今天：正文前的蓝点；提醒：正文最后一行行尾的琥珀色 ⏰ 时间；
           删除：最右边那个 ×。
 
         返回 (删除按钮的图元 id, 行高)；行高变化时会同步 canvas 的 height。
@@ -2118,15 +2165,25 @@ class TodoWidget(object):
         tag_text = " ".join("@" + tag for tag in tags)
         tag_font = self.fonts["marker"]
         tag_w = (tag_font.measure(tag_text) + self.px(6)) if tag_text else 0
+        when = item.get("remind_at")
+        remind_text = ("⏰" + format_remind_time(when)) if when else ""
+        remind_w = (tag_font.measure(remind_text) + self.px(6)) if remind_text else 0
         lines = self._wrap_text(item["text"], font,
-                               max(self.px(40), self.row_wrap - tag_w))
+                               max(self.px(40), self.row_wrap - tag_w - remind_w))
+        extras_w = tag_w + remind_w
+        extras_newline = bool(extras_w) and \
+            font.measure(lines[-1]) + extras_w > self.row_wrap
+        if extras_newline:
+            lines = self._wrap_text(item["text"], font,
+                                   max(self.px(40), self.row_wrap))
         step_h = self.fonts["small"].metrics("linespace") + self.px(2)
         step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
         step_rows = 0
         for step in steps:
             step_font = self.fonts["small_done"] if step["done"] else self.fonts["small"]
             step_rows += len(self._wrap_text(step["text"], step_font, step_wrap))
-        main_h = line_h * len(lines)
+        main_h = line_h * (len(lines) + (1 if extras_newline else 0))
+        canvas._main_h = main_h        # 双击改标题时输入框只盖这一块
         row_h = main_h + step_h * step_rows + 2 * self.row_pad_y
         if int(canvas.cget("height")) != row_h:
             canvas.configure(height=row_h)
@@ -2138,8 +2195,10 @@ class TodoWidget(object):
                 bar_top, bar_bottom = 0.0, float(row_h)
             else:
                 bar_top, bar_bottom = row_h * 0.25, row_h * 0.75
-            canvas.create_rectangle(0, bar_top, bar_w, bar_bottom, fill=C_HIGH,
-                                    outline="", tags="prio")
+            canvas.create_rectangle(
+                0, bar_top, bar_w, bar_bottom,
+                fill=C_HIGH if canvas._prio == PRIORITY_HIGH else C_MID,
+                outline="", tags="prio")
         # 今天：正文前面的小蓝点（在勾选框与文字之间的空档里，也不占宽度）
         if canvas._today:
             dot = max(2.0, self.px(3))
@@ -2154,12 +2213,26 @@ class TodoWidget(object):
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
                                anchor="nw", fill=text_color, font=font, tags="text")
+        canvas._remind_item = None
         canvas._tag_item = None
-        if tag_text and lines:
-            canvas._tag_item = canvas.create_text(
-                self.text_x + font.measure(lines[-1]) + self.px(6),
-                self.row_pad_y + (len(lines) - 1) * line_h + line_h / 2.0,
-                text=tag_text, anchor="w", fill=C_ACCENT, font=tag_font, tags="tag")
+        if lines:
+            if extras_newline:
+                extra_x = self.text_x
+                extra_line = len(lines)
+            else:
+                extra_x = self.text_x + font.measure(lines[-1]) + self.px(6)
+                extra_line = len(lines) - 1
+            line_y = self.row_pad_y + extra_line * line_h + line_h / 2.0
+            if remind_text:
+                remind_color = C_DANGER if when < time.time() else C_WAIT
+                canvas._remind_item = canvas.create_text(
+                    extra_x, line_y, text=remind_text, anchor="w",
+                    fill=remind_color, font=tag_font, tags="remind")
+                extra_x += tag_font.measure(remind_text) + self.px(6)
+            if tag_text and extra_x + tag_font.measure(tag_text) <=                     self.text_x + self.row_wrap:
+                canvas._tag_item = canvas.create_text(
+                    extra_x, line_y, text=tag_text, anchor="w",
+                    fill=C_ACCENT, font=tag_font, tags="tag")
         canvas._step_boxes = self._draw_steps(canvas, steps, self.row_pad_y + main_h, step_h)
         canvas._steps_done, canvas._steps_total = done_steps, total_steps
         canvas._markers = {
@@ -2440,16 +2513,34 @@ class TodoWidget(object):
             widget.create_rectangle(0, 0, self.px(3), height, fill=C_ACCENT, outline="",
                                     tags="dragbg")
             widget.tag_lower("dragbg")
+        self._drag_target = None
+        try:                             # 落点标记线：盖在当前拖到的位置
+            self._drop_line = tk.Frame(self.inner, bg=C_ACCENT, bd=0,
+                                       highlightthickness=0)
+        except tk.TclError:
+            self._drop_line = None
         self._start_autoscroll()
 
     def _end_drag(self):
-        item_id, self._drag_id = self._drag_id, None
+        item_id, target = self._drag_id, self._drag_target
+        self._drag_id = None
+        self._drag_target = None
         self._pointer_y = None
         self._stop_autoscroll()
+        if self._drop_line is not None:
+            try:
+                self._drop_line.destroy()
+            except tk.TclError:
+                pass
+            self._drop_line = None
         widget = self._row_widget(item_id)
         if widget is not None:
             widget.configure(cursor="hand2")
             widget.delete("dragbg")
+        if item_id is not None and target is not None:
+            # 落点是第几"行"，不是第几个数据 —— 有 @标签 筛选时列表比 items 短，
+            # 直接拿行号去 move 会挪错位置；这里换成那条数据在 items 里的下标。
+            self.store.move(item_id, self._store_index_for_row(target), save=False)
         self.store.save()                    # 新顺序落盘
         self._refresh()                      # 重画，保持行高/滚动位置一致
         self._schedule_regroup()             # 万一之前有改过状态还没归位，顺手补上
@@ -2460,11 +2551,25 @@ class TodoWidget(object):
                 return widget
         return None
 
-    def _drag_to(self, y_root):
-        """把被拖动的条目挪到指针所在的那一行（实时换位，松手才落盘）。
+    def _store_index_for_row(self, row_index):
+        """列表第 row_index 行 → 这条数据在 store.items 里的下标（筛选时两者不等长）。"""
+        if not self.row_widgets:
+            return row_index
+        try:
+            row_index = max(0, min(int(row_index), len(self.row_widgets) - 1))
+        except (TypeError, ValueError):
+            return 0
+        item_id = self.row_widgets[row_index][0]
+        for index, item in enumerate(self.store.items):
+            if item["id"] == item_id:
+                return index
+        return row_index
 
-        只在自己那一「段」里换位：默认排序是未完成 → 等待中 → 已完成，拖过界也只贴到
-        本段的头/尾，免得一次拖动就把分组打乱（想换段就点勾选框或小钟）。
+    def _drag_to(self, y_root):
+        """记下指针现在落在第几行（只出落点线，松手才真正挪 —— 见 _end_drag）。
+
+        只在自己那一「段」里落点：默认排序是未完成 → 等待中 → 已完成，拖过界也只贴到
+        本段的头/尾，免得一次拖动就把分组打乱（想换段就点勾选框或右键菜单里的「等待中」）。
         """
         if not self.row_widgets:
             return
@@ -2478,37 +2583,54 @@ class TodoWidget(object):
             first_top = self.row_widgets[0][1].winfo_rooty()
             target = 0 if y_root < first_top else len(self.row_widgets) - 1
         target = self._clamp_to_group(self._drag_id, target)
-        if target == self._index_of(self._drag_id):
+        self._drag_target = target
+        self._show_drop_line(target)     # 先让用户看见"会落到哪"，松手才真挪
+
+    def _show_drop_line(self, target):
+        """把落点标记线摆到第 target 行的上/下沿（往下拖画在下沿，往上拖画在上沿）。"""
+        line, dragged = self._drop_line, self._drag_id
+        if line is None or dragged is None or not self.row_widgets:
             return
-        if self.store.move(self._drag_id, target, save=False):
-            self._repack_rows()
+        try:
+            target = max(0, min(int(target), len(self.row_widgets) - 1))
+            current = self._index_of(dragged)
+            row = self.row_widgets[target][1]
+            y = row.winfo_y()
+            if target > current:
+                y += row.winfo_height()
+            width = max(self.list_w, self.inner.winfo_width() or self.list_w)
+            line.place(x=0, y=max(0, y - self.px(1)), width=width,
+                       height=max(1, self.px(2)))
+            line.lift()
+        except (tk.TclError, ValueError):
+            pass
 
     def _clamp_to_group(self, item_id, target):
-        """把落点夹到该条目所在状态段内（默认排序是分段的，拖拽不跨段）。"""
+        """把落点夹在该条目所在的**状态段**内（未完成 / 等待中 / 已完成三段）。
+
+        段内可以自由拖（跨「今天」「优先级」分组都行）—— A 方案，2026-10-26；
+        优先级/今天只在改动的那一刻决定插到哪一组，不再夹取拖拽。
+        """
         low, high = self._group_span(item_id)
         return max(low, min(int(target), high))
 
     def _bucket_of(self, item):
-        """排序桶：状态 → 是否今天 → 优先级。排序键就是这三样，拖拽也只在桶内换位。"""
+        """段内分组（状态 → 今天 → 优先级）；只用于"改优先级时插到哪一组"与自检。"""
         state = self.store.state_of(item)
         today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
         return (state, today_rank, -self.store.priority_of(item))
 
     def _group_span(self, item_id):
-        """被拖条目所在「桶」在 row_widgets 里的下标范围（含两端）。
-
-        桶 = 状态 + 是否今天 + 优先级。拖拽只在这个范围里换位，免得松手一归位就被弹回去
-        （想换桶就去点勾选框 / 小钟 / 今 / 旗子）。
-        """
+        """被拖条目所在**状态段**在 row_widgets 里的下标范围（含两端）。"""
         last = max(0, len(self.row_widgets) - 1)
         item = self._find_item(item_id)
         if item is None:
             return 0, last
-        key = self._bucket_of(item)
+        state = self.store.state_of(item)
         indexes = []
         for index, (row_id, _) in enumerate(self.row_widgets):
             row_item = self._find_item(row_id)
-            if row_item is not None and self._bucket_of(row_item) == key:
+            if row_item is not None and self.store.state_of(row_item) == state:
                 indexes.append(index)
         if not indexes:
             return 0, last
@@ -2672,6 +2794,10 @@ class TodoWidget(object):
             for item in due:
                 item["remind_at"] = None        # 只响一次；改时间再设
             self.store.save()
+            for item in due:                    # 行尾的 ⏰ 时间跟着消失
+                if not self._redraw_row(item["id"]):
+                    self._refresh()
+                    break
             self._show_alert(due)
             self._update_counts()
             if raise_it:
@@ -2724,6 +2850,7 @@ class TodoWidget(object):
         item = self.store.set_reminder(item_id, when)
         if item is None:
             return None
+        self._redraw_row(item_id)          # 行尾的 ⏰ 时间要立刻出现
         self._update_counts()
         self._flash_hint("已设提醒：%s" % format_remind_time(when))
         return item
@@ -2732,6 +2859,7 @@ class TodoWidget(object):
         item = self.store.clear_reminder(item_id)
         if item is None:
             return None
+        self._redraw_row(item_id)          # 行尾的 ⏰ 时间要立刻消失
         self._update_counts()
         self._flash_hint("已取消提醒")
         return item
@@ -2809,14 +2937,15 @@ class TodoWidget(object):
         self.canvas.itemconfigure(self.canvas.find_all()[0], width=event.width)
 
     # ---- 尺寸 / 位置 ----
-    def _resize(self):
+    def _resize(self, force=False):
+        """按内容定窗口尺寸；force=True 时连「用户拉过大小」也不照顾（折叠/展开要用）。"""
         self.card.update_idletasks()
         if self.store.ui["collapsed"]:
             height = self.header.winfo_reqheight() + self.px(2)
         else:
             height = self.card.winfo_reqheight() + self.px(2)
         width = self.panel_w
-        if self._user_sized:
+        if self._user_sized and not force:
             # 用户自己拉过大小：只增不减，别把他的窗口缩回去
             try:
                 width = max(width, self.root.winfo_width())
@@ -2840,7 +2969,8 @@ class TodoWidget(object):
         self.root.geometry("+%d+%d" % (x, y))
 
     def _apply_collapsed(self):
-        if self.store.ui["collapsed"]:
+        collapsed = self.store.ui["collapsed"]
+        if collapsed:
             self.input_row.pack_forget()
             self.list_area.pack_forget()
             self.footer.pack_forget()
@@ -2851,7 +2981,20 @@ class TodoWidget(object):
                              pady=(0, max(0, self.pad - self.px(4))))
         self._update_hint()
         self._draw_icon(self.collapse_btn, "collapse", C_DIM)
-        self._resize()
+        # 折叠要真的把窗口收成一条；展开要回到折叠前的高度（用户拉过大小也算）
+        self._resize(force=True)
+        if not collapsed:
+            size = self._expanded_size
+            if size is None and self._user_sized \
+                    and self.store.ui.get("height"):
+                size = (self.root.winfo_width(), int(self.store.ui["height"]))
+            if self._user_sized and size and int(size[1] or 0) > 1:
+                try:
+                    self.root.update_idletasks()
+                    self.root.geometry("%dx%d" % (self.root.winfo_width(), int(size[1])))
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+            self._expanded_size = None
     # ---- 拖动 ----
     def _drag_start(self, event):
         self._drag_offset = (event.x_root - self.root.winfo_x(),
@@ -2871,7 +3014,8 @@ class TodoWidget(object):
         self.store.ui["y"] = self.root.winfo_y()
         if self._user_sized:
             self.store.ui["width"] = self.root.winfo_width()
-            self.store.ui["height"] = self.root.winfo_height()
+            if not self.store.ui["collapsed"]:
+                self.store.ui["height"] = self.root.winfo_height()
         self.store.save()
 
     def _popup_menu(self, event):
@@ -2929,11 +3073,13 @@ class TodoWidget(object):
         return item
 
     def set_priority_item(self, item_id, value):
-        """右键菜单里选了优先级：重画那一行。"""
+        """右键菜单里选了优先级：改完插到新分组最前面（段内其余顺序不动）。"""
         item = self.store.set_priority(item_id, value)
         if item is None:
             return None
-        if not self._redraw_row(item_id):
+        if self.store.place_in_bucket(item_id):
+            self._refresh()                  # 位置变了：行顺序要重排
+        elif not self._redraw_row(item_id):
             self._refresh()
         return item
 
@@ -2956,23 +3102,25 @@ class TodoWidget(object):
         return item
 
     def cycle_priority_item(self, item_id):
-        """点旗子：无 → 高 → 中 → 无。排序会变，所以照例延迟归位。"""
+        """点旗子：无 → 高 → 中 → 无。改完插到新分组最前面。"""
         item = self.store.cycle_priority(item_id)
         if item is None:
             return None
-        if not self._redraw_row(item_id):
+        if self.store.place_in_bucket(item_id):
             self._refresh()
-        self._schedule_regroup()
+        elif not self._redraw_row(item_id):
+            self._refresh()
         return item
 
     def toggle_today_item(self, item_id):
-        """标记 / 取消「今天要办的」：会浮到本段最前，所以也延迟归位。"""
+        """标记 / 取消「今天要办的」：改完插到「今天」组最前面。"""
         item = self.store.toggle_today(item_id)
         if item is None:
             return None
-        if not self._redraw_row(item_id):
+        if self.store.place_in_bucket(item_id):
             self._refresh()
-        self._schedule_regroup()
+        elif not self._redraw_row(item_id):
+            self._refresh()
         self._update_footer()             # 底部「今天 x/y」要跟着变
         return item
 
@@ -3044,6 +3192,11 @@ class TodoWidget(object):
 
     def _begin_edit(self, item_id, event=None):
         """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
+        # 双击的第二次按下既会命中 <Double-Button-1>（打开编辑器），也会命中
+        # bind_all 的 <Button-1>（"点别处退出编辑"）—— 记下这一下的 serial，
+        # 让同一次事件里的全局处理放行，否则编辑器刚开就被自己关掉。
+        serial = getattr(event, "serial", None)
+        self._edit_open_serial = serial if serial else None
         if event is not None and event.x >= self._marker_zone_start():
             return                         # 双击落在右侧按钮上，不当编辑
         editor = self._steps_edit
@@ -3084,15 +3237,17 @@ class TodoWidget(object):
         tags = self.store.tags_of(item)
         entry.insert(0, item["text"] + (" " + " ".join("@" + t for t in tags) if tags else ""))
         entry.select_range(0, "end")
-        height = int(widget.cget("height"))
-        entry.place(x=self.text_x - self.px(2), y=self.px(2),
+        # 只盖标题文字那一块：有子步骤时子步骤继续露着（和子步骤编辑器同一个原则）
+        main_h = int(getattr(widget, "_main_h", 0)) or \
+            self.fonts["base"].metrics("linespace")
+        entry.place(x=self.text_x - self.px(2), y=self.row_pad_y,
                     width=max(self.px(40),
                               self.list_w - self.text_x - self.del_w - self.px(2)),
-                    height=max(self.px(16), height - 2 * self.px(2)))
+                    height=max(self.px(16), main_h))
         entry.bind("<Return>", lambda event: self._end_edit(save=True))
         entry.bind("<KP_Enter>", lambda event: self._end_edit(save=True))   # 小键盘回车
         entry.bind("<Escape>", lambda event: self._end_edit(save=False))
-        entry.bind("<FocusOut>", lambda event: self._end_edit(save=True))
+        entry.bind("<FocusOut>", self._edit_focus_out)
         self._edit_id = item_id
         self._edit_entry = entry
         try:
@@ -3100,8 +3255,12 @@ class TodoWidget(object):
         except tk.TclError:
             pass
 
-    def _end_edit(self, save=True):
-        """结束编辑：先把状态摘掉再销毁控件，免得回调打在被销毁的控件上。"""
+    def _end_edit(self, save=True, incremental=False):
+        """结束编辑：先把状态摘掉再销毁控件，免得回调打在被销毁的控件上。
+
+        incremental=True 只重画这一行、不整表重建：点到别的条目时要用它 ——
+        整表重建会把别的行控件也换掉，用户紧接着的双击就接不上了。
+        """
         entry, item_id = self._edit_entry, self._edit_id
         if entry is None:
             return False
@@ -3116,7 +3275,11 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         changed = self.store.rename(item_id, text) if save else False
-        self._refresh()
+        if incremental and self._redraw_row(item_id):
+            self._update_counts()
+            self._update_footer()
+        else:
+            self._refresh()
         self._schedule_regroup()             # 编辑结束再归位（编辑中归位会把输入框销毁）
         return changed
 
@@ -3202,6 +3365,43 @@ class TodoWidget(object):
             menu.destroy()
         except tk.TclError:
             pass
+
+    def _on_global_click(self, *args, **kwargs):
+        """点编辑框以外的地方：结束正在进行的编辑（按保存处理）。
+
+        三种编辑状态都管：改标题的单行框、子步骤的一组输入框、以及它们之间的切换。
+        子步骤编辑里那几块输入框、以及这一行的子步骤区（小方框 / 框间空隙）不算"外面"，
+        点了要保持编辑状态 —— 否则点小方框勾选会被误当成"点到别处"。
+        """
+        event = args[0] if args else None
+        if event is None:
+            return
+        serial = getattr(event, "serial", None)
+        if serial and self._edit_open_serial and serial == self._edit_open_serial:
+            return                           # 就是"打开编辑器"的那一次按下，别自己关自己
+        hit = getattr(event, "widget", None)
+        record = self._steps_edit
+        if record is not None:
+            boxes, item_id = record
+            if hit in boxes:
+                return                       # 点的是某一条子步骤的输入框
+            if self._inside_steps_area(hit, item_id, event):
+                return                       # 点的是这一行的子步骤区（小方框 / 空隙）
+            self._end_steps_edit(save=True, incremental=True)
+            self._press = None               # 这一下只用来"退出编辑"，别再顺手勾选别的条目
+            return
+        entry = self._edit_entry
+        if entry is not None and hit is not entry:
+            self._end_edit(save=True, incremental=True)
+            self._press = None               # 同上：松手时不执行"点条目 = 勾选"
+        return
+
+    def _inside_steps_area(self, hit, item_id, event):
+        """点击是否落在"正在编辑子步骤的那一行"的子步骤区里（含小方框与框间空隙）。"""
+        row = self._row_widget(item_id)
+        if row is None or hit is not row:
+            return False
+        return getattr(event, "y", 0) >= getattr(row, "_step_top", 1e9)
 
     def _clear_steps(self, item_id):
         if self.store.set_steps(item_id, []) is not None:
@@ -3548,6 +3748,31 @@ class TodoWidget(object):
         self._end_steps_edit(save=False)
         return "break"
 
+    def _edit_focus_out(self, event=None):
+        """改标题的输入框失焦：稍后再判断是真"点到别处"还是窗口本身没焦点。"""
+        try:
+            self.root.after(1, self._edit_check_focus)
+        except tk.TclError:
+            pass
+
+    def _edit_check_focus(self):
+        """焦点明确落到别的控件上才算"点别处保存"。
+
+        `focus_get()` 返回 None 有两种情况：Tk 窗口本身没有 X 焦点（切到别的应用、
+        或者自动化测试里没抢到焦点），以及焦点落在不接收键盘输入的画布上。
+        这两种都不代表"用户点了别处"—— 真正点别处由 _on_global_click 处理。
+        """
+        entry = self._edit_entry
+        if entry is None:
+            return
+        try:
+            focus = self.root.focus_get()
+        except (tk.TclError, KeyError):
+            focus = None
+        if focus is None or focus is entry:
+            return
+        self._end_edit(save=True)
+
     def _steps_focus_out(self, event=None):
         """某个子步骤框失焦：可能只是换到另一个框，稍后再判断要不要收。"""
         if self._steps_edit is None:
@@ -3566,12 +3791,17 @@ class TodoWidget(object):
             focus = self.root.focus_get()
         except (tk.TclError, KeyError):
             focus = None
-        if focus is not None and focus in record[0]:
+        if focus is None or focus in record[0]:
+            # None = 窗口本身没 X 焦点（切走 / 测试环境），不是"点了别处"；
+            # 真正的点别处由 _on_global_click 负责。
             return
         self._end_steps_edit(save=True)
 
-    def _end_steps_edit(self, save=True):
-        """收掉子步骤编辑器：save=False 直接丢弃；save=True 把每个框的文字写回（勾选照旧）。"""
+    def _end_steps_edit(self, save=True, incremental=False):
+        """收掉子步骤编辑器：save=False 直接丢弃；save=True 把每个框的文字写回（勾选照旧）。
+
+        incremental=True 只重画这一行（点别的条目退出编辑时用），理由同 _end_edit。
+        """
         record, self._steps_edit = self._steps_edit, None
         if record is None:
             return False
@@ -3605,7 +3835,11 @@ class TodoWidget(object):
                 steps.append({"text": text,
                               "done": bool(done[index]) if index < len(done) else False})
             changed = self.store.set_steps(item_id, steps) is not None
-        self._refresh()
+        if incremental and widget is not None and self._redraw_row(item_id):
+            self._update_counts()
+            self._update_footer()
+        else:
+            self._refresh()
         # 用户自己拉过窗口大小时，_resize() 只增不减 —— 编辑时撑高的那点要还回去，
         # 否则每编辑一次窗口就长高一行。
         if grew and window is not None and self._user_sized \
@@ -3624,7 +3858,13 @@ class TodoWidget(object):
             self._refresh(keep_scroll=False)
 
     def toggle_collapsed(self):
-        self.store.ui["collapsed"] = not self.store.ui["collapsed"]
+        collapsing = not self.store.ui["collapsed"]
+        if collapsing:
+            try:
+                self._expanded_size = (self.root.winfo_width(), self.root.winfo_height())
+            except tk.TclError:
+                self._expanded_size = None
+        self.store.ui["collapsed"] = collapsing
         self.store.save()
         self._apply_collapsed()
 
@@ -3634,11 +3874,90 @@ class TodoWidget(object):
         self.root.attributes("-topmost", value)
         self.store.save()
 
-    def _apply_alpha(self):
-        value = float(self._alpha_var.get())
+    def set_alpha(self, value, save=True):
+        """设置窗口透明度（0.3–1.0）；save=False 只预览，关对话框时再落盘。"""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        value = max(0.3, min(1.0, value))
         self.store.ui["alpha"] = value
-        self.root.attributes("-alpha", value)
-        self.store.save()
+        try:
+            self.root.attributes("-alpha", value)
+        except tk.TclError:
+            pass
+        if save:
+            self.store.save()
+        return value
+
+    def open_alpha_dialog(self):
+        """右键标题栏 →「窗口透明度…」：一条滑块，拖动即时预览，关掉即保存。"""
+        existing = self._alpha_dialog
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return existing
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        self._alpha_dialog = win
+        win.title("窗口透明度")
+        win.configure(bg=C_CARD)
+        win.transient(self.root)
+        win.resizable(False, False)
+        current = int(round(float(self.store.ui["alpha"]) * 100))
+        percent = tk.IntVar(master=win, value=current)
+        tk.Label(win, text="窗口透明度", bg=C_CARD, fg=C_DIM,
+                 font=self.fonts["small"]).pack(padx=self.px(14),
+                                                pady=(self.px(12), self.px(2)))
+        value_label = tk.Label(win, text="%d%%" % current, bg=C_CARD, fg=C_ACCENT,
+                               font=self.fonts["bold"])
+        value_label.pack()
+        scale = tk.Scale(win, from_=30, to=100, orient="horizontal",
+                         variable=percent, showvalue=0, length=self.px(200),
+                         bg=C_CARD, fg=C_DIM, troughcolor=C_BORDER,
+                         highlightthickness=0, bd=0, sliderrelief="raised",
+                         width=self.px(13), sliderlength=self.px(20),
+                         activebackground=C_ACCENT, relief="flat")
+        scale.pack(padx=self.px(14), pady=(self.px(2), self.px(4)))
+
+        def preview(_event=None):
+            value = max(30, min(100, int(percent.get())))
+            value_label.configure(text="%d%%" % value)
+            self.set_alpha(value / 100.0, save=False)
+
+        def save_now(_event=None):
+            self.set_alpha(percent.get() / 100.0, save=True)
+
+        def close(_event=None):
+            save_now()
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+            if self._alpha_dialog is win:
+                self._alpha_dialog = None
+
+        scale.configure(command=preview)
+        scale.bind("<ButtonRelease-1>", save_now)
+        win.bind("<Escape>", close)
+        win.bind("<Destroy>", lambda event: save_now() if event.widget is win else None)
+        win.protocol("WM_DELETE_WINDOW", close)
+        tk.Label(win, text="拖动即时预览，关掉即保存", bg=C_CARD, fg=C_MUTED,
+                 font=self.fonts["small"]).pack(padx=self.px(14),
+                                                pady=(0, self.px(10)))
+        win.update_idletasks()
+        win.geometry("+%d+%d" % (self.root.winfo_rootx() + self.px(40),
+                                 self.root.winfo_rooty() + self.px(70)))
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        scale.focus_set()
+        return win
 
     def _toggle_autostart(self):
         """右键菜单勾「开机自启」：装/拆自启项，不用再让用户去终端敲参数。"""
@@ -4061,6 +4380,7 @@ def run_check():
             problems.append("给不存在的条目设优先级应返回 None")
         # 「今天」要把老的那条顶到本段最前
         marks.toggle_today(m1["id"])
+        marks.place_in_bucket(m1["id"])          # A 方案：改「今天」时插到对应组最前
         if not m1.get("today") or marks.today_stats() != (0, 1):
             problems.append("「今天」标记或统计不对: %r %r"
                             % (m1.get("today"), marks.today_stats()))
@@ -4071,6 +4391,7 @@ def run_check():
         # 同为今天时先看优先级：给第二条高，它应该回到最前
         marks.cycle_priority(m2["id"])
         marks.toggle_today(m2["id"])
+        marks.place_in_bucket(m2["id"])          # 高优先级 + 今天 → 插到最前
         marks.resort()
         if [i["text"] for i in marks.items] != ["第二条", "第一条"]:
             problems.append("同是今天时应先按优先级: %r"
@@ -4092,6 +4413,28 @@ def run_check():
                                 for i in saved.items],))
         if [i["text"] for i in saved.items] != [i["text"] for i in marks.items]:
             problems.append("归位后的顺序没有落盘: %r" % ([i["text"] for i in saved.items],))
+
+        # ---- A 方案（2026-10-26）：段内手动顺序优先 ----
+        bucket = Store(os.path.join(temp_dir, "bucket.json"))
+        plain = bucket.add("普通")
+        high = bucket.add("高优先级")
+        bucket.set_priority(high["id"], PRIORITY_HIGH)
+        bucket.place_in_bucket(high["id"])
+        if [i["text"] for i in bucket.items] != ["高优先级", "普通"]:
+            problems.append("改优先级后没有插到对应组最前: %r"
+                            % ([i["text"] for i in bucket.items],))
+        bucket.move(high["id"], 1)               # 手动把它拖到后面
+        bucket.resort()
+        if [i["text"] for i in bucket.items] != ["普通", "高优先级"]:
+            problems.append("A 方案：resort 又把手动拖好的顺序按优先级弹回去了: %r"
+                            % ([i["text"] for i in bucket.items],))
+        bucket.toggle_today(plain["id"])
+        bucket.place_in_bucket(plain["id"])
+        if [i["text"] for i in bucket.items] != ["普通", "高优先级"]:
+            problems.append("标「今天」后没有插到段内最前: %r"
+                            % ([i["text"] for i in bucket.items],))
+        if bucket.resort():
+            problems.append("A 方案：已经排好的列表再 resort 不该有变化")
 
         # ---- 到点提醒 ----
         # 基准用写死的「2026-10-22 09:00」，其余都按相对量算，不依赖运行时刻
@@ -4241,7 +4584,15 @@ def run_check():
                 broken.add(text)
             widget._refresh()
             widget.toggle_collapsed()
+            if widget._expanded_size is None:
+                problems.append("折叠时没有记住展开尺寸（展开就回不到原高度）")
+            if widget.list_area.winfo_manager() != "":
+                problems.append("折叠之后列表还占着位置（窗口没真收起来）")
             widget.toggle_collapsed()
+            if widget._expanded_size is not None:
+                problems.append("展开之后还留着折叠前的尺寸记录")
+            if widget.list_area.winfo_manager() == "":
+                problems.append("展开之后列表没有回来")
             widget.clear_done()
             # 拖拽排序的代码路径（隐藏窗口下不校验落点几何，只验证能跑通、状态能收尾）
             widget._begin_drag(broken.items[0]["id"])
@@ -4499,6 +4850,55 @@ def run_check():
                 if "回车=保存" in str(widget.hint.cget("text")):
                     problems.append("编辑器收掉后，底部提示应当恢复: %r"
                                     % (widget.hint.cget("text"),))
+            # 子步骤编辑中：点别的条目退出编辑；点自己的框 / 小方框区不算
+            widget._begin_steps_edit(step_item["id"])
+            if widget._steps_edit is None:
+                problems.append("点别处退出编辑的用例打不开子步骤编辑器")
+            else:
+                first_box = widget._steps_edit[0][0]
+                hit_box = _StubEvent(x=5, y=5)
+                hit_box.widget = first_box
+                widget._on_global_click(hit_box)
+                if widget._steps_edit is None:
+                    problems.append("点子步骤输入框自己不该退出编辑")
+                edit_row = widget._row_widget(step_item["id"])
+                hit_steps = _StubEvent(x=widget.text_x + 2, y=int(edit_row._step_top) + 2)
+                hit_steps.widget = edit_row
+                widget._on_global_click(hit_steps)
+                if widget._steps_edit is None:
+                    problems.append("点子步骤小方框/空隙不该退出编辑（勾选会被吞掉）")
+                hit_title = _StubEvent(x=widget.text_x + 2, y=widget.row_pad_y)
+                hit_title.widget = edit_row
+                widget._on_global_click(hit_title)
+                if widget._steps_edit is not None:
+                    problems.append("点这一行的标题区应当退出子步骤编辑")
+            widget._begin_steps_edit(step_item["id"])
+            if widget._steps_edit is None:
+                problems.append("第二次打开子步骤编辑器失败")
+            else:
+                other_row = None
+                for row_id, row_widget in widget.row_widgets:
+                    if row_id != step_item["id"]:
+                        other_row = row_widget
+                        break
+                other_id = None
+                if other_row is not None:
+                    for row_id, row_widget in widget.row_widgets:
+                        if row_widget is other_row:
+                            other_id = row_id
+                            break
+                if other_row is None:
+                    problems.append("子步骤编辑退出用例找不到另一行")
+                else:
+                    outside = _StubEvent(x=5, y=5)
+                    outside.widget = other_row
+                    widget._on_global_click(outside)
+                    if widget._steps_edit is not None:
+                        problems.append("点其他条目没有退出子步骤编辑状态")
+                    if widget._row_widget(other_id) is not other_row:
+                        problems.append("退出子步骤编辑时把别的行也重建了"
+                                        "（紧接着的双击会接不上）")
+                widget._end_steps_edit(save=False)
             widget._begin_steps_edit(step_item["id"])
             esc_boxes = (widget._steps_edit or ([], None))[0]
             if esc_boxes:
@@ -4527,13 +4927,80 @@ def run_check():
                 saved_now = [s["text"] for s in widget.store.steps_of(step_item)]
                 if saved_now != ["回车保存的第一行", "回车保存的第二行"]:
                     problems.append("按回车保存的内容不对: %r" % (saved_now,))
+            # 双击改标题：输入框只盖标题那一块，子步骤继续露着
+            title_row = widget._row_widget(step_item["id"])
+            if title_row is not None:
+                step_top = int(getattr(title_row, "_step_top", 0))
+                main_h = int(getattr(title_row, "_main_h", 0) or 0)
+                widget._begin_edit(step_item["id"])
+                title_entry = widget._edit_entry
+                if title_entry is None:
+                    problems.append("双击改标题没有打开输入框")
+                else:
+                    place = title_entry.place_info()
+                    if int(place["y"]) != widget.row_pad_y:
+                        problems.append("改标题的输入框没有从标题行开始: y=%r"
+                                        % (place["y"],))
+                    if int(place["height"]) != max(widget.px(16), main_h):
+                        problems.append("改标题的输入框高度不对: %r（期望 %r）"
+                                        % (place["height"], max(widget.px(16), main_h)))
+                    if step_top and int(place["y"]) + int(place["height"]) > step_top:
+                        problems.append("改标题的输入框盖住子步骤了: %r + %r > %r"
+                                        % (place["y"], place["height"], step_top))
+                    # 打开编辑器的那一次按下（双击的第二下）不能被"点别处"逻辑关掉
+                    widget._end_edit(save=False)
+                    same_click = _StubEvent(x=widget.text_x + 2,
+                                            y=widget.row_pad_y + 2)
+                    same_click.serial = 424242
+                    widget._begin_edit(step_item["id"], same_click)
+                    if widget._edit_entry is None:
+                        problems.append("带 serial 的事件没能打开标题编辑框")
+                    widget._on_global_click(same_click)
+                    if widget._edit_entry is None:
+                        problems.append("同一次双击事件里的全局点击把刚打开的编辑器关掉了")
+                    widget._end_edit(save=False)
+                    widget._begin_edit(step_item["id"])
+                    title_entry = widget._edit_entry
+                    # 点编辑框自己不算"点到别处"
+                    inside = _StubEvent(x=widget.text_x + 4, y=widget.row_pad_y + 4)
+                    inside.widget = title_entry
+                    widget._on_global_click(inside)
+                    if widget._edit_entry is None:
+                        problems.append("点在标题编辑框自己身上不该结束编辑")
+                    # 点别的条目 = 结束编辑（保存）
+                    other_row, other_id = None, None
+                    for row_id, row_widget in widget.row_widgets:
+                        if row_id != step_item["id"]:
+                            other_row, other_id = row_widget, row_id
+                            break
+                    if other_row is None:
+                        problems.append("点别处退出编辑的用例找不到另一行")
+                    else:
+                        outside = _StubEvent(x=widget.text_x + 2, y=widget.row_pad_y + 2)
+                        outside.widget = other_row
+                        widget._on_global_click(outside)
+                        if widget._edit_entry is not None:
+                            problems.append("点其他条目没有退出标题编辑状态")
+                        if widget._row_widget(other_id) is not other_row:
+                            problems.append("点其他条目退出编辑时把那一行也重建了"
+                                            "（紧接着的双击会接不上）")
+                        # 退出编辑的那一下只该"退出"，松手不能顺手把别的条目勾成完成
+                        widget._begin_edit(step_item["id"])
+                        widget._press = {"id": other_id, "y": 0, "zone": "body",
+                                         "step": None}
+                        widget._on_global_click(outside)
+                        if widget._press is not None:
+                            problems.append("退出编辑的那一下没被吞掉"
+                                            "（松手会顺手勾选别的条目）")
+                    widget._end_edit(save=False)
 
             # 小键盘回车 / 点别处收菜单 / 右键加子步骤
             src2 = open(__file__, encoding="utf-8").read()
             kp_steps = 'box.bind("<KP_Enter>", self.' + '_steps_save_key)'
-            kp_entry = 'entry.bind("<KP_Enter>"'
-            if kp_steps not in src2 or kp_entry not in src2:
-                problems.append("小键盘回车没接上（子步骤框和主文字框都要接 KP_Enter）")
+            if kp_steps not in src2:
+                problems.append("子步骤框的小键盘回车没接上")
+            if not widget.entry.bind("<KP_Enter>"):
+                problems.append("顶部「添加待办」输入框没有接小键盘回车（按了没反应）")
             src3 = open(__file__, encoding="utf-8").read()
             if not widget.root.bind_all("<Button-1>"):
                 problems.append("没有装「点别处收起右键菜单」的全局绑定")
@@ -4633,9 +5100,16 @@ def run_check():
                 bars = row_mark.find_withtag("prio")
                 if len(bars) != 1:
                     problems.append("中优先级也该有一条竖条: %r" % (bars,))
-                elif row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] > row_h_now * 0.7:
-                    problems.append("中优先级的竖条应当只有半行高: %r"
-                                    % (row_mark.bbox(bars[0]),))
+                else:
+                    if row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] > row_h_now * 0.7:
+                        problems.append("中优先级的竖条应当只有半行高: %r"
+                                        % (row_mark.bbox(bars[0]),))
+                    mid_fill = str(row_mark.itemcget(bars[0], "fill"))
+                    if mid_fill == C_HIGH:
+                        problems.append("中优先级和高优先级颜色一样，看不出区别")
+                    elif mid_fill != C_MID:
+                        problems.append("中优先级竖条颜色不对: %r（期望 %r）"
+                                        % (mid_fill, C_MID))
                 sub.invoke(2)                                  # 无
                 if widget.store.priority_of(mark_item) != PRIORITY_NONE \
                         or row_mark.find_withtag("prio"):
@@ -4661,6 +5135,42 @@ def run_check():
                     menu.invoke(today_index)
                 if mark_item.get("today"):
                     problems.append("再从菜单点一次「今天要办的」应取消标记")
+            # A 方案：UI 改「今天」也要把那条浮到本段最前（不能只改数据不挪位置）
+            todo_probe = None
+            for entry in reversed(widget.store.items):
+                if widget.store.state_of(entry) == STATE_TODO and not entry.get("today"):
+                    todo_probe = entry
+                    break
+            if todo_probe is None:
+                problems.append("A 方案用例找不到可标今天的条目")
+            else:
+                widget.toggle_today_item(todo_probe["id"])
+                todo_ids = [row_id for row_id, _ in widget.row_widgets
+                            if widget.store.state_of(widget._find_item(row_id)) == STATE_TODO]
+                if not todo_ids or todo_ids[0] != todo_probe["id"]:
+                    problems.append("标「今天」后那条没有浮到本段最前（改今天没插组）")
+                widget.toggle_today_item(todo_probe["id"])      # 还原
+                widget._refresh()
+            # 提醒：行尾出现 ⏰ 时间、标题栏计数、取消后消失
+            row_mark = widget._row_widget(mark_item["id"])
+            if row_mark.find_withtag("remind"):
+                problems.append("没设提醒的条目行尾不该有 ⏰")
+            widget.set_reminder_item(mark_item["id"], time.time() + 3600)
+            row_mark = widget._row_widget(mark_item["id"])
+            remind_items = row_mark.find_withtag("remind")
+            if len(remind_items) != 1:
+                problems.append("设了提醒之后，条目行尾没有显示 ⏰ 时间: %r"
+                                % (remind_items,))
+            elif "⏰" not in str(row_mark.itemcget(remind_items[0], "text")):
+                problems.append("行尾提醒文字不对: %r"
+                                % (row_mark.itemcget(remind_items[0], "text"),))
+            if "提醒" not in str(widget.count.cget("text")):
+                problems.append("标题栏没有显示提醒数: %r"
+                                % (widget.count.cget("text"),))
+            widget.clear_reminder_item(mark_item["id"])
+            row_mark = widget._row_widget(mark_item["id"])
+            if row_mark.find_withtag("remind"):
+                problems.append("取消提醒后行尾 ⏰ 时间没有消失")
             # 菜单里该有的动作都在（删除不真的点，免得弹出撤销条影响后面的提示断言）
             menu = widget._build_row_menu(mark_item["id"])
             labels = " ".join(menu_label(menu, i)
@@ -4720,6 +5230,16 @@ def run_check():
                 problems.append("行尾没有画出 @电话 标签: %r" % (tag_item,))
             elif row_tag.bbox(tag_item)[2] > widget._marker_zone_start():
                 problems.append("行尾标签压到了右侧图标区")
+            # 长正文 + 标签 + 提醒：行尾内容放不下时要换到下一行，不能压右侧按钮
+            widget.set_reminder_item(tagged["id"], time.time() + 3600)
+            row_tag = widget._row_widget(tagged["id"])
+            for tagname in ("tag", "remind"):
+                for item_id in row_tag.find_withtag(tagname):
+                    bbox = row_tag.bbox(item_id)
+                    if bbox and bbox[2] > widget._marker_zone_start():
+                        problems.append("行尾 %s 压到了右侧图标区: %r"
+                                        % (tagname, bbox))
+            widget.clear_reminder_item(tagged["id"])
             if not widget.tags_row.winfo_children():
                 problems.append("有标签时顶部筛选条没有生成筛选项")
             widget.set_filter("电话")
@@ -4939,6 +5459,33 @@ def run_check():
                                    for i in range(widget.menu.index("end") + 1))
             if "查看归档" not in head_labels:
                 problems.append("页头右键菜单里没有「查看归档…」入口: %r" % (head_labels,))
+            if "窗口透明度" not in head_labels:
+                problems.append("页头右键菜单里没有「窗口透明度…」: %r" % (head_labels,))
+            # 透明度是一条滑块：拖动即时预览，关掉即保存
+            alpha_dialog = widget.open_alpha_dialog()
+            root.update()
+            scales = [child for child in alpha_dialog.winfo_children()
+                      if isinstance(child, tk.Scale)]
+            if not scales:
+                problems.append("透明度对话框里没有滑块")
+            else:
+                if not scales[0].cget("command"):
+                    problems.append("透明度滑块没有接实时预览")
+                try:
+                    if float(scales[0].cget("from")) >= float(scales[0].cget("to")):
+                        problems.append("透明度滑块的取值范围不对")
+                except (TypeError, ValueError):
+                    problems.append("透明度滑块的取值范围读不出来")
+            widget.set_alpha(0.8, save=False)
+            if abs(float(root.attributes("-alpha")) - 0.8) > 1e-6:
+                problems.append("设置透明度没有作用到窗口: %r"
+                                % (root.attributes("-alpha"),))
+            widget.set_alpha(0.94, save=True)
+            try:
+                alpha_dialog.destroy()
+            except tk.TclError:
+                pass
+            widget._alpha_dialog = None
 
             # ---- 尺寸：默认排版不能变，拉大后要跟着重排 ----
             default_w = _scaled(PANEL_W, widget.s)
@@ -4993,12 +5540,48 @@ def run_check():
                     problems.append("拖拽落点没有被限制在本状态段内")
                 if widget._clamp_to_group(todo_items[0]["id"], -5) != 0:
                     problems.append("拖拽落点下界没有被夹住")
+                # 段内要能跨「今天 / 优先级」自由拖（A 方案）：范围覆盖整个未完成段。
+                # 先把一条设成高优先级、另一条标今天，制造出不同分组，否则"按桶夹取"
+                # 的错误实现也能蒙混过关（反例实测抓到过）。
+                span_probe = todo_items[0]
+                other_todo = None
+                for entry in todo_items[1:]:
+                    if entry["id"] != span_probe["id"]:
+                        other_todo = entry
+                        break
+                widget.store.set_priority(span_probe["id"], PRIORITY_HIGH)
+                widget.store.place_in_bucket(span_probe["id"])
+                if other_todo is not None:
+                    widget.store.toggle_today(other_todo["id"])
+                    widget.store.place_in_bucket(other_todo["id"])
+                widget._refresh()
+                todo_rows = [index for index, (row_id, _) in enumerate(widget.row_widgets)
+                             if broken.state_of(widget._find_item(row_id)) == STATE_TODO]
+                if todo_rows and widget._group_span(span_probe["id"]) != \
+                        (min(todo_rows), max(todo_rows)):
+                    problems.append("同一状态段内不能跨优先级/今天拖动: %r（期望 %r）"
+                                    % (widget._group_span(span_probe["id"]),
+                                       (min(todo_rows), max(todo_rows))))
+                widget.store.set_priority(span_probe["id"], PRIORITY_NONE)
+                if other_todo is not None:
+                    widget.store.toggle_today(other_todo["id"])
+                widget.store.resort()
+                widget._refresh()
                 # 真拖一次：往「已完成」那一段里拖，不能跨过去（跨段只能靠勾选/小钟）
                 dragged = todo_items[0]["id"]
                 done_row = widget._row_widget(broken.items[done_indexes[0]]["id"])
                 widget._begin_drag(dragged)
+                if widget._drop_line is None:
+                    problems.append("开始拖动没有创建落点标记线")
                 widget._drag_to(done_row.winfo_rooty() + 1)
+                if widget._drop_line is not None and \
+                        widget._drop_line.winfo_manager() != "place":
+                    problems.append("拖动中落点标记线没有摆出来")
+                if widget._drag_target is None:
+                    problems.append("拖动中没有记下落点位置（松手时会挪错地方）")
                 widget._end_drag()
+                if widget._drop_line is not None:
+                    problems.append("松手后落点标记线没有清掉")
                 after_items = list(broken.items)
                 dragged_at = [i for i, e in enumerate(after_items) if e["id"] == dragged]
                 done_first = [i for i, e in enumerate(after_items)
@@ -5006,6 +5589,25 @@ def run_check():
                 if dragged_at and done_first and dragged_at[0] >= done_first[0]:
                     problems.append("拖拽把条目拖进了别的状态段: %r"
                                     % ([e["text"] for e in after_items],))
+                # 有 @标签 筛选时列表比 items 短：拖拽落点必须换算成数据下标，
+                # 拿行号当数据下标会挪错条目（老 bug，2026-10-26 修）
+                probe_txt = "筛选拖动探针"
+                filter_probe = widget.store.add(probe_txt + " @探针")
+                filler = widget.store.add("筛选探针的垫片")   # 让探针不在第 0 个
+                widget._refresh()
+                widget.set_filter("探针")
+                visible_probe = widget._visible_items()
+                if len(visible_probe) == 1 and widget.row_widgets:
+                    expect_index = [i["id"] for i in widget.store.items].index(
+                        filter_probe["id"])
+                    got_index = widget._store_index_for_row(0)
+                    if got_index != expect_index:
+                        problems.append("筛选状态下拖拽落点没有换算成数据下标: %r != %r"
+                                        % (got_index, expect_index))
+                widget.set_filter(None)
+                widget.store.pop(filter_probe["id"])
+                widget.store.pop(filler["id"])
+                widget._refresh()
             # 编辑期间不归位（归位会重建行、把输入框一起销毁）
             edit_target = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
             if edit_target:
@@ -5024,6 +5626,9 @@ def run_check():
             alert_target = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
             if alert_target:
                 broken.set_reminder(alert_target[0]["id"], time.time() - 1)
+                widget._redraw_row(alert_target[0]["id"])   # 模拟界面上设提醒后的重画
+                if not widget._row_widget(alert_target[0]["id"]).find_withtag("remind"):
+                    problems.append("到点前条目行尾应当有 ⏰ 时间")
                 widget._remind_tick(raise_it=False)
                 if "⏰" not in str(widget.hint.cget("text")):
                     problems.append("到点后没有弹出提醒横幅: %r"
@@ -5032,6 +5637,9 @@ def run_check():
                     problems.append("到点后没有显示「知道了」")
                 if broken.due_reminders():
                     problems.append("到点提醒没有被清掉，会重复响")
+                alert_row = widget._row_widget(alert_target[0]["id"])
+                if alert_row is not None and alert_row.find_withtag("remind"):
+                    problems.append("到点后行尾 ⏰ 时间没有消失（会一直挂着过期提醒）")
                 widget._dismiss_alert()
                 if widget.alert_btn.winfo_manager() == "pack":
                     problems.append("点「知道了」后横幅没有收起")

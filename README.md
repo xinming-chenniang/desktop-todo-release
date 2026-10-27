@@ -7,13 +7,13 @@
 
 ## 下载
 
-- 安装包（推荐）：[desktop-todo_0.2.3_all.deb](desktop-todo_0.2.3_all.deb)（72K）
+- 安装包（推荐）：[desktop-todo_0.2.6_all.deb](desktop-todo_0.2.6_all.deb)（80K）
 - 源码：[desktop_todo.py](desktop_todo.py)（单文件，`python3 desktop_todo.py` 直接运行）
-- 校验：`fe2c5547caf0f75dd14906b270a38b321b9495a2b45a235c723e8d8b937f6598`（SHA256，记录在 `SHA256SUMS`）
+- 校验：`ad7d79d782448f463a5b80d71ef025f646e9abdbfbf6c0a910e251a384e27dc4`（SHA256，记录在 `SHA256SUMS`）
 
 ## 安装（三步）
 
-1. 下载本仓库根目录的 `desktop-todo_0.2.3_all.deb`
+1. 下载本仓库根目录的 `desktop-todo_0.2.6_all.deb`
 2. **双击**，按提示输入密码安装
 3. 打开**启动器**，搜「桌面待办」
 
