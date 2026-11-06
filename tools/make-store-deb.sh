@@ -15,6 +15,18 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# 可复现构建：固定时间戳。同一份源码 + 同一个 SOURCE_DATE_EPOCH → 同一份 deb 字节，
+# 第三方可以自己重打一遍核对哈希。优先级：环境变量 > 最近一次 commit 时间 > 当前时间。
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || true)
+fi
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(date +%s)
+    echo "!! 没有 SOURCE_DATE_EPOCH、也没有 git 历史：本次构建不可复现" >&2
+fi
+export SOURCE_DATE_EPOCH
+echo "== SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+
 APPID="com.github.xinming-chenniang.desktoptodo"
 APP_NAME="桌面待办"
 VERSION3=$(python3 - <<'PY'
@@ -101,7 +113,7 @@ Version: $VERSION4
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Depends: python3 (>= 3.7), python3-tk, libx11-6
+Depends: python3 (>= 3.7), python3-gi, gir1.2-gtk-3.0, libx11-6
 Installed-Size: $SIZE
 Maintainer: xinming-chenniang <xinming-chenniang@users.noreply.github.com>
 Homepage: https://gitee.com/xinming-chenniang/desktop-todo
@@ -109,7 +121,7 @@ Description: $APP_NAME —— 常驻桌面的待办清单挂件
  常驻桌面右上角的待办清单：无标题栏、可拖动、回车即记，支持三态（未完成 /
  等待中 / 已完成）、子步骤、优先级、情境标签与到点提醒。
  .
- 单文件、只用 Python 标准库、不联网、无账号；数据保存在本机。
+ 单文件、Python 标准库 + 系统 GTK3、不联网、无账号；数据保存在本机。
 EOF
 
     OUT="dist/store/${APPID}_${VERSION4}_${ARCH}.deb"

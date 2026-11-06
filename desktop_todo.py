@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""桌面待办清单挂件（Deepin / X11 + tkinter）。
+"""桌面待办清单挂件（统信 UOS / Deepin X11 + GTK3）。
 
 一个常驻桌面、无边框的小窗口：回车添加、点勾选完成、右键条目标记「等待中」，
 点 × 删除，所有改动立即写入 JSON，重开自动恢复待办与窗口位置。
@@ -12,9 +12,12 @@
 默认**不置顶**：它就是普通窗口，会被别的窗口盖住，不会一直挡在前面；
 需要时在右键菜单里勾「始终置顶」（勾选状态会记住）。
 
-它也**不在任务栏 / dock 里显示图标**（EWMH 的 `SKIP_TASKBAR`/`SKIP_PAGER`）。
+它也**不在任务栏 / dock 里显示图标**（GTK 的 skip-taskbar / skip-pager 提示）。
 被别的窗口盖住后，按全局快捷键（默认 `Super+T`，可用 `--hotkey` 改）、用 `Alt+Tab`，
 或者**再运行一次本程序**，都能把它叫到最前面。
+
+界面用 GTK3 原生控件（Pango 排版、主题 symbolic 图标、CSS 样式），不再自绘 Canvas：
+常驻内存与交互延迟都是原生量级，也不再需要 4× 超采样 PNG 遮锯齿。
 
 用法::
 
@@ -29,10 +32,10 @@
 
     回车 / 「+」      添加待办
     点文字或方框      标记完成 / 取消完成
-    右键条目          等待中 / 今天要办的 / 优先级 / 子步骤 / 删除
-    按住条目上下拖     调整顺序（松手即保存）
+    右键条目          等待中 / 今天要办的 / 优先级 / 提醒 / 子步骤 / 删除
+    按住条目上下拖     调整顺序（松手即保存，只在同一状态组内）
     双击条目          改文字
-    点 ×             删除该条
+    点 ×             删除该条（8 秒内可撤销）
     拖标题栏          移动窗口
     双击标题栏        折叠 / 展开（右键标题栏还有菜单，含「查看归档…」）
     Esc              清空输入框
@@ -41,28 +44,245 @@
 """
 
 import argparse
-import json
-import re
+import csv
 import ctypes
+import json
 import os
+import re
 import shutil
 import socket
 import sys
 import tempfile
 import time
+import traceback
 
 try:
-    import tkinter as tk
-    from tkinter import font as tkfont
-except ImportError:            # 没装 python3-tk 时，--doctor / --data-file 仍要能跑出信息
-    tk = None
-    tkfont = None
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango
+except (ImportError, ValueError):      # 没装 python3-gi 时 --doctor / --data-file 仍要能跑
+    gi = None
+    Gdk = GLib = Gtk = Pango = None
 
 APP_ID = "desktop-todo"
 # 商店规范要求倒置域名做包名；窗口类名/数据目录仍用 APP_ID，避免老用户数据搬家
 APP_STORE_ID = "com.github.xinming-chenniang.desktoptodo"
-APP_VERSION = "0.2.6"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
+APP_VERSION = "0.5.0"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
+DATA_VERSION = 1           # todos.json 的格式版本；改结构时 +1，并在 MIGRATIONS 里补迁移
+MIGRATIONS = {}            # {旧版本号: 函数(raw)->raw}；目前没有历史格式，先留好升级路径
 
+
+def _lang_is_en():
+    """LANG / LC_ALL 以 en 开头即视为英文界面（只读环境变量，不改系统配置）。"""
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = (os.environ.get(key) or "").strip().lower()
+        if value:
+            return value.startswith("en")
+    return False
+
+
+def tr(zh, en):
+    """最小字符串表：英文环境返回英文，否则中文。界面与 CLI 共用。"""
+    return en if _lang_is_en() else zh
+
+
+class _TkCompat:
+    """旧 X11 集成代码里 ``except tk.TclError`` / ``tk.READABLE`` 的兼容壳。
+
+    那批代码（去标题栏 / 不进任务栏 / EWMH 唤回 / 全局快捷键 / 单实例）是 Tk 时代
+    在 KWin 上逐条验出来的，换 GUI 工具箱时原样保留、只补一层 root 适配
+    （见 GtkRootShim）；现在不会再有 Tcl 错误，保留异常类型只为让那些 except 能写。
+    """
+
+    class TclError(Exception):
+        pass
+
+    READABLE = 1
+
+
+tk = _TkCompat()
+
+# ---------- 尺寸 ----------
+PANEL_W = 360              # 面板默认宽度（像素）
+PANEL_W_MIN = 360          # 允许拉到的最窄
+PANEL_W_MAX = 520          # 允许拉到的最宽；再宽也只是窗口变宽，内容列限宽居中
+LIST_MAX_RATIO = 0.70      # 列表最多占屏幕高度的比例，超出滚动
+
+# ---------- 模型常量（Store / 自检共用，和 v0.3.0 一致）----------
+UNDO_SECONDS = 8           # 删除后「撤销」保留的秒数
+ARCHIVE_MAX = 500          # 归档最多留多少条（超了丢最老的）
+TAG_MAX = 3                 # 一条最多几个情境标签
+TAG_LEN = 8                 # 单个标签最长几个字
+TAG_RE = re.compile(r"(?:^|\s)@([\w\u4e00-\u9fff]{1,%d})(?=\s|$)" % TAG_LEN)
+DOUBLE_CLICK_REVERT_S = 0.8     # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
+REMIND_POLL_MS = 15000          # 到点提醒的检查间隔（15 秒；只在主窗口里跑）
+REMIND_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$")
+
+# 条目状态：未完成 / 等待中 / 已完成
+# 「等待中」= 已经着手了，但在等别人反馈（现在自己动不了），所以既不算完成、也不该被当成待办催自己。
+STATE_TODO = "todo"
+STATE_WAITING = "waiting"
+STATE_DONE = "done"
+# 列表默认排序：未完成 → 等待中 → 已完成（同组内保持手动拖出来的顺序）
+STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
+STEP_MAX = 20               # 一条待办最多几个子步骤（防止数据被灌爆）
+
+# 优先级：0 无 / 1 中 / 2 高（值越大越靠前）；点一下按这个顺序循环
+PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH = 0, 1, 2
+PRIORITY_CYCLE = (PRIORITY_NONE, PRIORITY_HIGH, PRIORITY_MID)
+
+PLACEHOLDER = "记一条，回车保存"
+
+
+_GTK_READY = [False]
+
+
+def screen_size():
+    """屏幕尺寸（用显示器的 geometry；Gdk.Screen.get_width 已被废弃）。"""
+    display = Gdk.Display.get_default() if Gdk is not None else None
+    if display is None:
+        return 1920, 1080
+    monitor = display.get_primary_monitor() or display.get_monitor(0)
+    if monitor is None:
+        return 1920, 1080
+    geometry = monitor.get_geometry()
+    return int(geometry.width), int(geometry.height)
+
+
+def set_window_opacity(win, value):
+    """设置窗口透明度（gtk_window_set_opacity 在 3.24 标了 deprecated，但 X11 上仍然有效）。"""
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            win.set_opacity(max(0.3, min(1.0, float(value))))
+    except Exception:
+        pass
+
+
+def gtk_ready():
+    """初始化 GTK（幂等）。没装 gi / 连不上显示时返回 False，调用方据此给提示。"""
+    if Gtk is None:
+        return False
+    if _GTK_READY[0]:
+        return True
+    try:
+        result = Gtk.init_check(None)
+        ok = result[0] if isinstance(result, (tuple, list)) else bool(result)
+    except Exception:
+        ok = False
+    _GTK_READY[0] = bool(ok)
+    return _GTK_READY[0]
+
+
+# --------------------------------------------------------------------------- #
+# Tk 风格 root 适配层
+#
+# 旧的系统集成代码（本文件"集成层"一节）签名都是 Tk 的 root：
+# winfo_id / state / deiconify / lift / withdraw / attributes / focus_force / after /
+# tk.createfilehandler。这里把 Gtk.Window 包成同样的样子，那批代码一行不用改。
+# --------------------------------------------------------------------------- #
+class _TkFileHandlers(object):
+    """``root.tk.createfilehandler`` 的 GObject 版本（用 GLib.io_add_watch 实现）。"""
+
+    def __init__(self):
+        self.sources = {}
+
+    def createfilehandler(self, sock, _mode, callback):
+        def on_io(_fd, _condition, sock=sock, callback=callback):
+            try:
+                callback(sock, _condition)
+            except Exception:
+                pass
+            return True
+
+        self.sources[sock] = GLib.io_add_watch(sock.fileno(), GLib.IO_IN, on_io)
+
+    def deletefilehandler(self, sock):
+        source = self.sources.pop(sock, None)
+        if source is not None:
+            GLib.source_remove(source)
+
+
+class GtkRootShim(object):
+    """把 Gtk.Window 包成旧集成代码认识的 Tk 风格 root（只实现它们用到的方法）。"""
+
+    def __init__(self, win):
+        self.win = win
+        self.tk = _TkFileHandlers()
+
+    # ---- 身份 ----
+    def winfo_id(self):
+        gdk_window = self.win.get_window()
+        return int(gdk_window.get_xid()) if gdk_window is not None else 0
+
+    # ---- 状态 ----
+    def state(self):
+        gdk_window = self.win.get_window()
+        if gdk_window is None or not self.win.get_visible():
+            return "withdrawn"
+        if gdk_window.get_state() & Gdk.WindowState.ICONIFIED:
+            return "iconic"
+        return "normal"
+
+    def winfo_viewable(self):
+        # 注意：PyGObject 的 Gdk.WindowState 没有 VIEWABLE 这个成员（C 里有、没导出来），
+        # 用它会让 activate_window 直接抛 AttributeError，而旧 _poll 的 except Exception
+        # 会把它吞掉 —— 表现就是「快捷键注册了但按了没反应」。用 get_mapped() 判断。
+        return bool(self.win.get_visible() and self.win.get_mapped())
+
+    def update_idletasks(self):
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+    # ---- 动作 ----
+    def deiconify(self):
+        self.win.deiconify()
+        self.win.present()
+
+    def withdraw(self):
+        self.win.hide()
+
+    def lift(self):
+        self.win.present()
+
+    def focus_force(self):
+        try:
+            self.win.present_with_time(Gtk.get_current_event_time() or 0)
+        except Exception:
+            self.win.present()
+
+    def attributes(self, name, value):
+        if name == "-topmost":
+            self.win.set_keep_above(bool(value))
+        elif name == "-alpha":
+            self.win.set_opacity(float(value))
+
+    def after(self, milliseconds, callback, *args):
+        def fire():
+            try:
+                callback(*args)
+            except Exception:
+                pass
+            return False
+
+        return GLib.timeout_add(max(1, int(milliseconds)), fire)
+
+    def after_cancel(self, job_id):
+        try:
+            GLib.source_remove(job_id)
+        except Exception:
+            pass
+
+
+# ===========================================================================
+# 集成层：X11 唤回 / 全局快捷键 / 单实例 / 开机自启 / 数据路径
+#
+# 这一节由 v0.3.0（tkinter 版）原样继承：它在 KWin / startdde 上逐条验证过，
+# 只把 root 换成 GtkRootShim（见文件头）。不要在没有真机复验的情况下改。
+# ===========================================================================
 
 class _XClientMessageEvent(ctypes.Structure):
     """Xlib 的 XClientMessageEvent（用来给 WM 发 _NET_WM_STATE 消息）。"""
@@ -77,105 +297,6 @@ class _XClientMessageEvent(ctypes.Structure):
         ("format", ctypes.c_int),
         ("data", ctypes.c_long * 5),
     ]
-
-
-# ---------- 外观 ----------
-PANEL_W = 300          # 面板宽度（像素）
-PAD = 12               # 面板内边距
-LIST_MAX_H = 268       # 列表区最大高度，超出后滚轮滚动
-LIST_W = PANEL_W - 2 * PAD - 2          # 列表区宽度
-TEXT_X = 36            # 条目文字起始 x（给勾选框留位置）
-DEL_W = 30             # 条目右侧删除按钮的点击区宽度
-ROW_PAD_Y = 6          # 条目上下内边距
-ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
-UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
-ARCHIVE_MAX = 500      # 归档最多留多少条（超了丢最老的）
-TAG_MAX = 3            # 一条最多几个情境标签
-TAG_LEN = 8            # 单个标签最长几个字
-TAG_RE = re.compile(r"(?:^|\s)@([\w\u4e00-\u9fff]{1,%d})(?=\s|$)" % TAG_LEN)
-DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
-REMIND_POLL_MS = 15000        # 到点提醒的检查间隔（15 秒；只在主窗口里跑）
-REMIND_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$")
-
-# 条目状态：未完成 / 等待中 / 已完成
-# 「等待中」= 已经着手了，但在等别人反馈（现在自己动不了），所以既不算完成、也不该被当成待办催自己。
-STATE_TODO = "todo"
-STATE_WAITING = "waiting"
-STATE_DONE = "done"
-# 列表默认排序：未完成 → 等待中 → 已完成（同组内保持手动拖出来的顺序）
-STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
-WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度
-TODAY_W = 26            # 条目右侧「今天」按钮的点击区宽度
-PRIO_W = 26             # 条目右侧「优先级」按钮的点击区宽度
-STEPS_W = 30            # 条目右侧「子步骤」按钮的点击区宽度
-STEP_MAX = 20           # 一条待办最多几个子步骤（防止数据被灌爆）
-STEP_BOX = 11           # 子步骤小方框边长
-STEP_INDENT = 20        # 子步骤文字相对条目文字的缩进
-
-# 优先级：0 无 / 1 中 / 2 高（值越大越靠前）；点一下按这个顺序循环
-PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH = 0, 1, 2
-PRIORITY_CYCLE = (PRIORITY_NONE, PRIORITY_HIGH, PRIORITY_MID)
-
-C_CARD = "#24272c"     # 卡片底色
-C_LIST = "#1d2024"     # 输入框 / 列表底色
-C_BORDER = "#3a3f47"   # 边框
-C_TEXT = "#e9ebee"     # 主文字
-C_DIM = "#98a0aa"      # 次要文字
-C_MUTED = "#6d7480"    # 更淡的文字 / 图标
-C_ACCENT = "#4c9aff"   # 强调色
-C_DANGER = "#e5695f"   # 删除悬停
-C_HOVER = "#2e333a"    # 拖动中的条目底色
-C_DONE = "#7b828c"     # 已完成文字
-C_WAIT = "#e0a33e"     # 等待中文字 / 图标
-C_HIGH = "#ff7a59"     # 高优先级：橙红（整行竖条）
-C_MID = "#e6b93f"      # 中优先级：金黄（半行竖条，和高区分开）
-
-PLACEHOLDER = "添加一条待办，回车确认"
-FONT_STACK = (
-    "Noto Sans CJK SC",
-    "Source Han Sans SC",
-    "WenQuanYi Micro Hei",
-    "Droid Sans Fallback",
-    "DejaVu Sans",
-)
-
-
-# --------------------------------------------------------------------------- #
-# 界面缩放（高 DPI / 系统缩放）
-#
-# Tk 的字号单位是「点」，会随显示器 DPI 自动放大；而本程序的窗口尺寸是像素，
-# 不会跟着变。于是 125% / 150% 缩放下会出现「字变大、面板不变」：文字挤、
-# 列表变窄、标题栏发紧。这里用统一的缩放系数把像素尺寸按同样比例放大。
-#
-# 系数取自 Tk 自己算的 tk scaling（X11 依据 Xft.dpi），
-# 与字号用的是同一套依据，不会出现两套比例打架。缩放为 1.0 时，
-# 下面所有 _scaled() 的返回值都与基准常量逐像素相同——即默认观感一点不变。
-# --------------------------------------------------------------------------- #
-TK_SCALING_AT_96DPI = 96.0 / 72.0     # Tk 的 scaling 就是「每点多少像素」
-
-
-def ui_scale(root):
-    """返回界面缩放系数（1.0 = 96dpi / 100%）。"""
-    try:
-        scaling = float(root.tk.call("tk", "scaling"))
-    except (tk.TclError, ValueError, TypeError, AttributeError):
-        return 1.0
-    if scaling <= 0:
-        return 1.0
-    return max(1.0, min(3.0, scaling / TK_SCALING_AT_96DPI))
-
-
-def _scaled(value, scale):
-    """基准像素值 → 当前缩放下的像素值。
-
-    scale=1.0 时**原样返回**（不改动、也不取整）：像勾选框的 6.5 / 21.5 这种半像素
-    值一旦走 round() 会被银行家舍入（6.5→6、21.5→22），在 100% 缩放下反而比原来
-    偏 0.5~1px，那就违反了「默认观感一点不变」。
-    """
-    if scale == 1.0:
-        return value
-    return int(round(value * scale))
-
 
 # --------------------------------------------------------------------------- #
 # 窗口管理器交互
@@ -312,8 +433,6 @@ def set_skip_taskbar(root):
 
     return _on_wm_window(root, apply)
 
-
-# --------------------------------------------------------------------------- #
 # 全局快捷键（X11：把键抓在根窗口上，不需要 WM 配合）
 #
 # 为什么需要它：这个窗口刻意不进任务栏、也没有托盘图标（Deepin 23 的 dde-dock
@@ -397,6 +516,46 @@ def format_hotkey(spec):
     return "+".join(names + [shown])
 
 
+def parse_todotxt(text):
+    """把 todo.txt 内容解析成 [{"text","done","priority","due"}]。
+
+    支持：``x `` 完成前缀（可带日期）、``(A)``/``(B)`` 优先级、
+    ``@context``（留在正文里，交给 Store.parse_tags）、``due:YYYY-MM-DD``（转成当天 09:00 提醒）。
+    """
+    import datetime
+
+    items = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        done = False
+        priority = PRIORITY_NONE
+        if line.startswith("x "):
+            done = True
+            line = line[2:].strip()
+            # 完成行常带一到两个日期前缀
+            line = re.sub(r"^\d{4}-\d{2}-\d{2}\s+(?:\d{4}-\d{2}-\d{2}\s+)?", "", line)
+        match = re.match(r"^\(([A-Z])\)\s+", line)
+        if match:
+            priority = PRIORITY_HIGH if match.group(1) == "A" else PRIORITY_MID
+            line = line[match.end():]
+        due_at = None
+        due = re.search(r"\bdue:(\d{4})-(\d{2})-(\d{2})\b", line)
+        if due:
+            try:
+                due_at = datetime.datetime(int(due.group(1)), int(due.group(2)),
+                                           int(due.group(3)), 9, 0).timestamp()
+            except ValueError:
+                due_at = None
+            line = re.sub(r"\s*\bdue:\d{4}-\d{2}-\d{2}\b", "", line).strip()
+        if not line:
+            continue
+        items.append({"text": line, "done": done,
+                      "priority": priority, "due": due_at})
+    return items
+
+
 def parse_remind_time(text, now=None):
     """把 `HH:MM` 解析成「下一个该时刻」的时间戳；认不出返回 None。
 
@@ -428,7 +587,7 @@ def format_remind_time(when, now=None):
     if (target.tm_year, target.tm_yday) == (today.tm_year, today.tm_yday):
         return clock
     if (target.tm_year, target.tm_yday) == (tomorrow.tm_year, tomorrow.tm_yday):
-        return "明天 " + clock
+        return tr("明天 ", "tomorrow ") + clock
     return "%02d-%02d " % (target.tm_mon, target.tm_mday) + clock
 
 
@@ -596,17 +755,6 @@ class X11Hotkey(object):
         except tk.TclError:
             self.job = None
 
-
-# --------------------------------------------------------------------------- #
-# 窗口能力与系统集成（X11 / EWMH，统信 UOS / Deepin）
-#
-# 本项目只服务统信 UOS / Deepin(X11)：2026-10-19 起 Windows 支持已整体移除，原来那层
-# PlatformBackend / X11Backend / WindowsBackend 接口也随之删掉 —— 这一节就是唯一那份实现：
-#   * 窗口外观：_MOTIF_WM_HINTS 去标题栏（strip_window_decorations）；
-#   * 不进任务栏：EWMH 的 SKIP_TASKBAR + SKIP_PAGER（set_skip_taskbar）；
-#   * 单实例唤回：unix 套接字 + Tk 文件事件（single_instance_start / _stop）；
-#   * 全局快捷键：XGrabKey 抓根窗口（X11Hotkey，见上）；
-#   * 开机自启：~/.config/autostart + 同名应用条目（Deepin/UOS 的 startdde 要能解析出应用 id）。
 # --------------------------------------------------------------------------- #
 _DIAG_PATH = None      # 唤回诊断日志的落点，由界面层 set_diag_path() 设成「数据文件旁边」
 
@@ -673,7 +821,6 @@ def _send_active_window(x11, display, target, root_window, timestamp=0):
     x11.XSendEvent(ctypes.c_void_p(display), ctypes.c_ulong(root_window), 0, mask,
                    ctypes.byref(event))
 
-
 def activate_window(root, topmost, notify_wm=True, timestamp=0):
     """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。
 
@@ -728,13 +875,12 @@ def activate_window(root, topmost, notify_wm=True, timestamp=0):
     except tk.TclError as error:
         write_diag("activate 失败: %r" % (error,))
 
-
 # ---- 单实例：unix 套接字 + Tk 文件事件（第二个进程靠它唤回已有窗口）----
 _SERVER = None
 
 
-def single_instance_start(root, on_raise):
-    """监听套接字：第二个进程连上来发一句 raise 就唤回窗口。"""
+def single_instance_start(root, on_raise, on_add=None):
+    """监听套接字：第二个进程发 raise 唤回窗口，发 add\t<文本> 就在运行中的实例里加一条。"""
     global _SERVER
     path = ipc_socket_path()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -754,14 +900,19 @@ def single_instance_start(root, on_raise):
             connection, _ = server.accept()
         except OSError:
             return
+        data = b""
         try:
-            connection.recv(64)
+            data = connection.recv(4096)
             connection.sendall(b"ok\n")
         except OSError:
             pass
         finally:
             connection.close()
-        on_raise()
+        command, text = parse_ipc(data)
+        if command == "add" and text and on_add is not None:
+            on_add(text)
+        else:
+            on_raise()
 
     try:
         root.tk.createfilehandler(server, tk.READABLE, on_readable)
@@ -811,7 +962,6 @@ def hotkey_remove():
     if _HOTKEY is not None:
         _HOTKEY.remove()
         _HOTKEY = None
-
 
 # ---- 开机自启：~/.config/autostart/*.desktop ----
 #
@@ -912,11 +1062,6 @@ def autostart_uninstall():
         print("已移除应用菜单条目: %s" % app_entry)
     return 0
 
-
-
-# --------------------------------------------------------------------------- #
-# 数据层
-# --------------------------------------------------------------------------- #
 def data_dir():
     """返回数据目录（遵循 XDG_DATA_HOME）。"""
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(
@@ -929,16 +1074,30 @@ def data_file():
     return os.path.join(data_dir(), "todos.json")
 
 
+def parse_ipc(data):
+    """解析单实例套接字上的一条命令，返回 (命令, 文本)。
+
+    ``raise`` = 唤回窗口；``add\t<文本>`` = 在运行中的实例里加一条待办。
+    """
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    command, _, text = data.partition("\t")
+    if command.strip() == "add":
+        return "add", text.rstrip("\n")
+    return "raise", None
+
+
 def ipc_socket_path():
     """单实例套接字路径（放在 XDG_RUNTIME_DIR 或临时目录）。"""
     base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
     return os.path.join(base, "%s.sock" % APP_ID)
 
 
-def raise_running_instance():
-    """已有实例在跑时让它把窗口叫到最前面；成功返回 True。
+def raise_running_instance(payload=b"raise\n"):
+    """把一条命令发给已在运行的实例；成功返回 True。
 
-    任务栏里看不到这个窗口，所以「再运行一次」就是最顺手的唤回方式。
+    默认发 ``raise``，即「再运行一次」把窗口叫到最前面（任务栏里看不到它）。
+    ``--add`` 复用同一条套接字，发 ``add\t<文本>``。
     """
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(1.5)
@@ -947,13 +1106,27 @@ def raise_running_instance():
     except OSError:
         return False
     try:
-        client.sendall(b"raise\n")
+        client.sendall(payload)
         client.recv(16)
     except OSError:
         return False
     finally:
         client.close()
     return True
+
+
+# ===========================================================================
+# 数据层（v0.3.0 原样）
+# ===========================================================================
+
+def _fmt_ts(value):
+    """把 epoch 秒格式化成给 CSV 看的本地时间字符串（空值返回空串）。"""
+    if not value:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
 
 
 class Store(object):
@@ -966,14 +1139,21 @@ class Store(object):
         # 需要时在右键菜单里勾「始终置顶」，勾选状态会被记住。
         self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94,
                    "topmost": False, "hotkey": HOTKEY_DEFAULT,
-                   "width": None, "height": None}
+                   "width": None, "height": None, "done_collapsed": False,
+                   "sound": True}
         self.archive = []                 # 归档：完成的（过 00:00）/ 清掉的 / 删掉的都进这里
         self._next_id = 1
+        self.load_error = None            # 读取被拒绝的原因（例如数据来自更新版本）
+        self.loaded_version = DATA_VERSION
         self.load()
 
     # ---- 读写 ----
     def load(self):
-        """读取数据；文件缺失按空清单处理，损坏则备份后从空清单开始。"""
+        """读取数据；文件缺失按空清单处理，损坏则备份后从空清单开始。
+
+        版本策略：没有 version 字段的旧文件按 1 处理；低于当前版本走 MIGRATIONS；
+        高于当前版本**拒绝读取**，并把原文件移到 ``.newer`` —— 降级打开时不能把新数据写坏。
+        """
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
@@ -985,6 +1165,29 @@ class Store(object):
         if not isinstance(raw, dict):
             return
 
+        raw_version = raw.get("version")
+        if raw_version is None:
+            version = 1                   # 没有 version 字段的旧文件：结构等同 v1
+        else:
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError):
+                version = 1
+        if version > DATA_VERSION:
+            self.load_error = ("数据文件由更新版本（version %d）写入，当前版本只认到 "
+                               "version %d；原文件已移到 %s"
+                               % (version, DATA_VERSION, self.path + ".newer"))
+            self._backup_newer()
+            return
+        if version < DATA_VERSION:
+            raw = self._migrate(raw, version)
+        self.loaded_version = version
+        self._apply(raw)
+
+    def _apply(self, raw, with_ui=True):
+        """把一份数据字典装进 Store（load 与 import 共用；with_ui=False 时不改窗口状态）。"""
+        self.items = []
+        self.archive = []
         archived = raw.get("archive")
         if isinstance(archived, list):
             for record in archived:
@@ -1033,7 +1236,8 @@ class Store(object):
         if self.items:
             self._next_id = max(item["id"] for item in self.items) + 1
             self.resort()                     # 默认排序：未完成 → 等待中 → 已完成
-
+        if not with_ui:
+            return
         ui = raw.get("ui")
         if isinstance(ui, dict):
             for key in ("x", "y"):
@@ -1042,8 +1246,12 @@ class Store(object):
                     self.ui[key] = int(value)
             if isinstance(ui.get("collapsed"), bool):
                 self.ui["collapsed"] = ui["collapsed"]
+            if isinstance(ui.get("done_collapsed"), bool):
+                self.ui["done_collapsed"] = ui["done_collapsed"]
             if isinstance(ui.get("topmost"), bool):
                 self.ui["topmost"] = ui["topmost"]
+            if isinstance(ui.get("sound"), bool):
+                self.ui["sound"] = ui["sound"]
             hotkey = ui.get("hotkey")
             if isinstance(hotkey, str) and parse_hotkey(hotkey) is not None:
                 self.ui["hotkey"] = hotkey
@@ -1054,6 +1262,26 @@ class Store(object):
             alpha = ui.get("alpha")
             if isinstance(alpha, (int, float)) and 0.3 <= float(alpha) <= 1.0:
                 self.ui["alpha"] = float(alpha)
+
+    def _migrate(self, raw, version):
+        """把旧版本数据升到 DATA_VERSION；没有对应迁移函数时按当前结构读（字段容错兜底）。"""
+        while version < DATA_VERSION:
+            step = MIGRATIONS.get(version)
+            if step is None:
+                break
+            raw = step(raw)
+            version += 1
+        return raw
+
+    def _backup_newer(self):
+        """把「更新版本写的数据文件」整体移走（不解析、不覆盖），降级打开时不破坏它。"""
+        target = self.path + ".newer"
+        if os.path.exists(target):
+            target = "%s.%s" % (target, time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            shutil.move(self.path, target)
+        except (IOError, OSError):
+            pass
 
     def _backup_broken(self):
         try:
@@ -1069,12 +1297,96 @@ class Store(object):
                 os.makedirs(directory)
             temp = self.path + ".tmp"
             with open(temp, "w", encoding="utf-8") as handle:
-                json.dump({"version": 1, "items": self.items,
+                json.dump({"version": DATA_VERSION, "items": self.items,
                            "archive": self.archive, "ui": self.ui},
                           handle, ensure_ascii=False, indent=2)
             os.replace(temp, self.path)
         except (IOError, OSError):
             pass
+
+    # ---- 备份 / 导出 / 导入 ----
+    def backup_copy(self, tag="import-backup"):
+        """把当前数据文件复制一份（导入前用）；返回备份路径，没有数据文件时返回 None。"""
+        if not os.path.exists(self.path):
+            return None
+        target = "%s.%s" % (self.path, tag)
+        try:
+            shutil.copy2(self.path, target)
+            return target
+        except (IOError, OSError):
+            return None
+
+    def export_dict(self):
+        return {"version": DATA_VERSION,
+                "app_version": APP_VERSION,
+                "exported_at": time.time(),
+                "items": self.items,
+                "archive": self.archive}
+
+    def export_json(self, path):
+        """导出完整数据（条目 + 归档）到 JSON；返回导出的条目数。"""
+        payload = self.export_dict()
+        temp = path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp, path)
+        return len(payload["items"])
+
+    def export_csv(self, path):
+        """导出条目为 CSV（供表格查看，不用于恢复）；返回行数。"""
+        fields = ["id", "text", "state", "priority", "today", "tags",
+                  "steps_done", "steps_total", "created", "done_at", "remind_at"]
+        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(fields)
+            for item in self.items:
+                steps = item.get("steps") or []
+                writer.writerow([
+                    item.get("id"), item.get("text", ""),
+                    self.state_of(item),
+                    item.get("priority") or 0,
+                    "1" if item.get("today") else "0",
+                    " ".join("@" + tag for tag in (item.get("tags") or [])),
+                    sum(1 for step in steps if step.get("done")),
+                    len(steps),
+                    _fmt_ts(item.get("created")),
+                    _fmt_ts(item.get("done_at")),
+                    _fmt_ts(item.get("remind_at")),
+                ])
+        return len(self.items)
+
+    def import_json(self, path):
+        """用导出的 JSON 覆盖当前数据（先验证文件再动数据）；返回 (条目数, 归档数)。"""
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+            raise ValueError("不是有效的待办导出文件（缺少 items 列表）")
+        if not raw["items"] and not raw.get("archive"):
+            raise ValueError("导出文件里没有条目，拒绝用它清空数据")
+        self._apply(raw, with_ui=False)
+        self.save()
+        return len(self.items), len(self.archive)
+
+    def import_todotxt(self, path):
+        """把 todo.txt 文件合并进当前数据（不覆盖已有条目）；返回新增条数。"""
+        with open(path, "r", encoding="utf-8") as handle:
+            entries = parse_todotxt(handle.read())
+        if not entries:
+            raise ValueError("文件里没有可导入的条目")
+        added = 0
+        for entry in entries:
+            item = self.add(entry["text"])
+            if item is None:
+                continue
+            added += 1
+            if entry["done"]:
+                self.toggle(item["id"])
+            if entry["priority"]:
+                self.set_priority(item["id"], entry["priority"])
+            if entry["due"]:
+                self.set_reminder(item["id"], entry["due"])
+        self.save()
+        return added
 
     # ---- 条目操作 ----
     def add(self, text):
@@ -1123,8 +1435,8 @@ class Store(object):
         return None
 
     # ---- 到点提醒 ----
-    # 只在本机算时间、只在本机弹：不调用 notify-send、不起子进程（命令被劫持 / 无桌面通知守护时
-    # 都会静默失败），因此「无 subprocess」这条安全声明不用改。
+    # 只在本机算时间、只在本机弹：不调用 notify-send、不起外部进程（命令被劫持 /
+    # 无桌面通知守护时都会静默失败），因此「不调用外部命令」这条安全声明不用改。
     def set_reminder(self, item_id, when):
         """给一条设提醒时间（epoch 秒）；返回条目，找不到返回 None。"""
         for item in self.items:
@@ -1560,999 +1872,2346 @@ class Store(object):
         return any(item["done"] for item in self.items)
 
 
+
 # --------------------------------------------------------------------------- #
-# 界面层
+# 界面层（GTK3 / Adwaita）
+#
+# 结构：Window（卡片）→ Header / 输入条 / 标签 chip / 列表 / Footer。
+# 列表按状态分组，每组若干 Row；Row 是 EventBox + Box 的组合，不再自绘 Canvas。
+# 性能要点：
+#   * 勾选/等待/优先级/今天/勾子步骤 = 就地改这一行，不重建控件、不重排窗口；
+#   * 只有"结构变了"（增删/筛选/折叠/归档/拖拽落位）才重建列表；
+#   * 窗口缩放只重排（GTK 自己重排 + 调列表上限），不重建任何控件。
 # --------------------------------------------------------------------------- #
-class TodoWidget(object):
+
+# 主题：默认深色（Adwaita dark），DESKTOP_TODO_THEME=light 跟随浅色。
+# 颜色一律用 GTK 主题的命名色（@theme_* / @borders / @warning_color…），
+# 所以系统换主题/强调色时本挂件自动跟着变，不写死色值。
+_THEME_NAME = os.environ.get("DESKTOP_TODO_THEME", "dark").strip().lower()
+
+_CSS = """
+window { background-color: transparent; }
+
+.card {
+  background-color: @theme_bg_color;
+  border: 1px solid alpha(@theme_fg_color, 0.12);
+  border-radius: 12px;
+}
+
+.title { color: @theme_fg_color; font-size: 15pt; font-weight: bold; }
+.subtitle { color: alpha(@theme_fg_color, 0.55); font-size: 9pt; }
+/* 折叠态单行 header：标题和计数并排，整体压到 ~34px 高 */
+.title-compact { color: @theme_fg_color; font-size: 13pt; font-weight: bold; }
+.count-compact { color: alpha(@theme_fg_color, 0.55); font-size: 9pt; }
+.compact .iconbtn { min-width: 16px; min-height: 16px; padding: 2px; }
+
+.iconbtn {
+  background: transparent; background-image: none; border: none;
+  box-shadow: none; border-radius: 6px; padding: 3px;
+  color: alpha(@theme_fg_color, 0.75); min-width: 18px; min-height: 18px;
+}
+.iconbtn:hover { background-color: alpha(@theme_fg_color, 0.08); color: @theme_fg_color; }
+.iconbtn:active { background-color: alpha(@theme_fg_color, 0.14); }
+.iconbtn.danger:hover { color: @error_color; }
+
+entry.add {
+  background-color: @theme_base_color;
+  color: @theme_fg_color;
+  border: 1px solid alpha(@theme_fg_color, 0.15);
+  border-radius: 9px; padding: 7px 10px; min-height: 18px;
+}
+entry.add:focus { border-color: @theme_selected_bg_color; }
+
+button.plus {
+  background-image: none;
+  background-color: @theme_selected_bg_color;
+  color: @theme_selected_fg_color;
+  border: none; border-radius: 9px; padding: 6px 9px;
+}
+button.plus:hover { background-color: shade(@theme_selected_bg_color, 1.12); }
+button.plus:active { background-color: shade(@theme_selected_bg_color, 0.92); }
+
+button.chip {
+  background: transparent; background-image: none;
+  border: 1px solid transparent; border-radius: 999px;
+  padding: 2px 10px; font-size: 9pt;
+  color: alpha(@theme_fg_color, 0.55);
+}
+button.chip:hover { background-color: alpha(@theme_fg_color, 0.07); }
+button.chip.on {
+  background-color: alpha(@theme_selected_bg_color, 0.22);
+  color: @theme_fg_color;
+  border-color: alpha(@theme_selected_bg_color, 0.55);
+}
+
+.section { color: alpha(@theme_fg_color, 0.55); font-size: 9pt; font-weight: bold; }
+.section-count { color: alpha(@theme_fg_color, 0.40); font-size: 9pt; }
+
+.row { background-color: transparent; border-radius: 6px; border: 1px solid transparent; }
+.row:hover { background-color: alpha(@theme_fg_color, 0.06); }
+.row.selected {
+  background-color: alpha(@theme_selected_bg_color, 0.20);
+  border-color: alpha(@theme_selected_bg_color, 0.65);
+}
+
+.row-title { color: @theme_fg_color; font-size: 11pt; }
+.row-title.done { color: alpha(@theme_fg_color, 0.50); }
+.row-title.waiting { color: @warning_color; }
+
+.meta { color: alpha(@theme_fg_color, 0.52); font-size: 9pt; }
+.meta-strong { color: alpha(@theme_fg_color, 0.72); font-size: 9pt; }
+.badge { border-radius: 4px; padding: 0px 5px; font-size: 8.5pt; }
+.badge.hi { background-color: alpha(@error_color, 0.18); color: @error_color; }
+.badge.mid { background-color: alpha(@warning_color, 0.18); color: @warning_color; }
+.badge.today {
+  background-color: alpha(@theme_selected_bg_color, 0.18);
+  color: @theme_selected_bg_color;
+}
+
+.step { color: alpha(@theme_fg_color, 0.72); font-size: 9.5pt; }
+.step.done { color: alpha(@theme_fg_color, 0.48); font-size: 9.5pt; }
+
+.hint { color: alpha(@theme_fg_color, 0.45); font-size: 8.5pt; }
+.hint.warn { color: @warning_color; }
+.link { color: @theme_selected_bg_color; font-size: 8.5pt; }
+.link:hover { text-decoration: underline; }
+button.linkbtn {
+  background: transparent; background-image: none; border: none;
+  box-shadow: none; border-radius: 4px; padding: 2px 6px;
+  color: @theme_selected_bg_color; font-size: 8.5pt; min-height: 16px;
+}
+button.linkbtn:hover { text-decoration: underline; }
+button.linkbtn.warn { color: @warning_color; }
+
+.empty-title { color: alpha(@theme_fg_color, 0.72); font-size: 11pt; }
+.empty-sub { color: alpha(@theme_fg_color, 0.50); font-size: 9pt; }
+
+popover, popover.background { background-color: @theme_bg_color; }
+popover modelbutton, popover menuitem { color: @theme_fg_color; padding: 5px 10px; font-size: 9.5pt; }
+popover modelbutton:hover { background-color: alpha(@theme_fg_color, 0.08); }
+separator { background-color: alpha(@theme_fg_color, 0.12); min-height: 1px; }
+
+.dlg { background-color: @theme_bg_color; }
+.dlg-label { color: alpha(@theme_fg_color, 0.72); font-size: 9.5pt; }
+.dlg-error { color: @error_color; font-size: 9pt; }
+
+.drophint { background-color: @theme_selected_bg_color; border-radius: 1px; min-height: 2px; }
+.dragrow { background-color: alpha(@theme_selected_bg_color, 0.20);
+           border: 1px solid alpha(@theme_selected_bg_color, 0.65); border-radius: 6px; }
+.alert { color: @warning_color; font-size: 8.5pt; }
+"""
+
+
+def install_css():
+    """把界面样式挂到默认屏幕上（应用级优先级，只挂一次）。
+
+    主题口径（用户 2026-10-28 选 B：GNOME / Adwaita 原生）：
+      * DESKTOP_TODO_THEME 缺省 dark → 本进程用 Adwaita 深色；
+      * =light → Adwaita 浅色；
+      * =system → 不动主题，跟随系统（本机是 deepin 主题）并读取系统深浅色偏好。
+    只在**本进程**内切主题，不改用户的系统设置。
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(_CSS.encode("utf-8"))
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    settings = Gtk.Settings.get_default()
+    if settings is None:
+        return
+    if _THEME_NAME == "system":
+        # 跟随系统：先看 color-scheme（GNOME 有，UOS 20 的 schema 里没有这个键），
+        # 没有就退回"主题名里带 dark"的判断。注意：对不存在的键调 get_string 是
+        # g_error（直接 abort 进程），所以必须先查 schema.has_key。
+        dark = False
+        try:
+            import gi as _gi
+            _gi.require_version("Gio", "2.0")
+            from gi.repository import Gio
+            source = Gio.SettingsSchemaSource.get_default()
+            schema = source.lookup("org.gnome.desktop.interface", True) \
+                if source is not None else None
+            if schema is not None and schema.has_key("color-scheme"):
+                prefs = Gio.Settings.new("org.gnome.desktop.interface")
+                dark = prefs.get_string("color-scheme") == "prefer-dark"
+            else:
+                dark = "dark" in str(settings.get_property("gtk-theme-name")).lower()
+        except Exception:
+            dark = False
+        settings.set_property("gtk-application-prefer-dark-theme", dark)
+    else:
+        settings.set_property("gtk-theme-name", "Adwaita")
+        settings.set_property("gtk-application-prefer-dark-theme",
+                              _THEME_NAME != "light")
+
+
+class Palette(object):
+    """把 GTK 主题里的命名色取成 RGBA，供 cairo 自绘（勾选圆）使用。
+
+    CSS 里已经直接用 @theme_* 了；这里只解决"Python 画的部分怎么跟主题同色"。
+    """
+
+    def __init__(self, style_context):
+        def lookup(name, fallback):
+            ok, rgba = style_context.lookup_color(name)
+            if ok:
+                return rgba
+            return Gdk.RGBA(*fallback)
+
+        self.bg = lookup("theme_bg_color", (0.14, 0.14, 0.15, 1.0))
+        self.fg = lookup("theme_fg_color", (1.0, 1.0, 1.0, 1.0))
+        self.accent = lookup("theme_selected_bg_color", (0.21, 0.52, 0.89, 1.0))
+        self.accent_fg = lookup("theme_selected_fg_color", (1.0, 1.0, 1.0, 1.0))
+        self.borders = lookup("borders", (0.35, 0.35, 0.37, 1.0))
+        self.warning = lookup("warning_color", (0.96, 0.76, 0.07, 1.0))
+        self.error = lookup("error_color", (0.88, 0.11, 0.14, 1.0))
+        self.insensitive = lookup("insensitive_fg_color", (0.55, 0.55, 0.57, 1.0))
+
+    @staticmethod
+    def mix(a, b, amount):
+        return Gdk.RGBA(a.red + (b.red - a.red) * amount,
+                        a.green + (b.green - a.green) * amount,
+                        a.blue + (b.blue - a.blue) * amount,
+                        a.alpha + (b.alpha - a.alpha) * amount)
+
+    def with_alpha(self, color, alpha):
+        return Gdk.RGBA(color.red, color.green, color.blue, alpha)
+
+
+class Clamp(Gtk.Bin):
+    """内容限宽居中：宽度最多 max_width，比它窄时照常铺满（GTK3 没有 AdwClamp）。"""
+
+    def __init__(self, child, max_width):
+        super().__init__()
+        self.max_width = max_width
+        self.add(child)
+
+    def do_get_preferred_width(self):
+        minimum, natural = Gtk.Bin.do_get_preferred_width(self)
+        return min(minimum, self.max_width), min(natural, self.max_width)
+
+    def do_size_allocate(self, allocation):
+        self.set_allocation(allocation)
+        child = self.get_child()
+        if child is None or not child.get_visible():
+            return
+        width = min(allocation.width, self.max_width)
+        rect = Gdk.Rectangle()
+        rect.x = allocation.x + (allocation.width - width) // 2
+        rect.y = allocation.y
+        rect.width = width
+        rect.height = allocation.height
+        child.size_allocate(rect)
+
+
+def icon_image(name, size=16):
+    image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.BUTTON)
+    image.set_pixel_size(int(size))
+    return image
+
+
+def icon_button(name, size=15, danger=False, tooltip=None):
+    button = Gtk.Button()
+    button.get_style_context().add_class("iconbtn")
+    if danger:
+        button.get_style_context().add_class("danger")
+    button.add(icon_image(name, size))
+    if tooltip:
+        button.set_tooltip_text(tooltip)
+    return button
+
+
+class CheckMark(Gtk.DrawingArea):
+    """圆形勾选框（cairo 抗锯齿，颜色取自 GTK 主题）。"""
+
+    def __init__(self, app, size=18, done=False, waiting=False, on_click=None):
+        super().__init__()
+        self.app = app
+        self.size = int(size)
+        self.done = bool(done)
+        self.waiting = bool(waiting)
+        self.hover = False
+        self.on_click = on_click
+        self.set_size_request(self.size, self.size)
+        self.connect("draw", self._draw)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.ENTER_NOTIFY_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("button-press-event", self._pressed)
+        self.connect("enter-notify-event", self._hover_on)
+        self.connect("leave-notify-event", self._hover_off)
+        self.set_tooltip_text(tr("标记完成 / 取消完成", "Mark done / undo"))
+        self._update_a11y()
+
+    def _pressed(self, _widget, event):
+        if event.button != 1:
+            return False
+        if self.on_click is not None:
+            self.on_click()
+        return True
+
+    def _hover_on(self, _widget, _event):
+        self.hover = True
+        self.queue_draw()
+        return False
+
+    def _hover_off(self, _widget, _event):
+        self.hover = False
+        self.queue_draw()
+        return False
+
+    def _update_a11y(self):
+        """给屏幕阅读器一个可读名称（自绘控件本身没有文字）。"""
+        state = tr("已完成", "done") if self.done else (
+            tr("等待中", "waiting") if self.waiting else tr("未完成", "not done"))
+        try:
+            self.get_accessible().set_name(tr("完成状态：%s", "Status: %s") % state)
+        except Exception:
+            pass
+
+    def set_state(self, done=None, waiting=None):
+        if done is not None:
+            self.done = bool(done)
+        if waiting is not None:
+            self.waiting = bool(waiting)
+        self._update_a11y()
+        self.queue_draw()
+
+    def _draw(self, _widget, cr):
+        palette = self.app.palette
+        size = float(self.size)
+        # cairo 的 ANTIALIAS 枚举：DEFAULT=0 / NONE=1 / GRAY=2。
+        # 必须显式用 GRAY —— 写成 1 是 NONE，等于关掉抗锯齿，
+        # 勾选圆/勾/子步骤方框会退化成 1-bit 硬边（v0.4.0 初版就错在这）。
+        cr.set_antialias(2)
+        if self.done:
+            if self.size >= 16:
+                cr.set_source_rgba(palette.accent.red, palette.accent.green,
+                                   palette.accent.blue, palette.accent.alpha)
+                cr.arc(size / 2.0, size / 2.0, size / 2.0 - 0.8, 0, 6.28318)
+                cr.fill()
+                cr.set_source_rgba(palette.bg.red, palette.bg.green,
+                                   palette.bg.blue, 1.0)
+                cr.set_line_width(size * 0.105)
+                cr.move_to(size * 0.28, size * 0.52)
+                cr.line_to(size * 0.44, size * 0.68)
+                cr.line_to(size * 0.74, size * 0.34)
+                cr.stroke()
+            else:                         # 子步骤的小方框：圆角方形 + 勾
+                radius = size * 0.22
+                cr.set_source_rgba(palette.accent.red, palette.accent.green,
+                                   palette.accent.blue, palette.accent.alpha)
+                self._rounded_rect(cr, 0.6, 0.6, size - 1.2, size - 1.2, radius)
+                cr.fill()
+                cr.set_source_rgba(palette.bg.red, palette.bg.green,
+                                   palette.bg.blue, 1.0)
+                cr.set_line_width(size * 0.14)
+                cr.move_to(size * 0.26, size * 0.52)
+                cr.line_to(size * 0.44, size * 0.70)
+                cr.line_to(size * 0.76, size * 0.32)
+                cr.stroke()
+        else:
+            if self.hover:
+                color = palette.accent
+            elif self.waiting:
+                color = palette.warning
+            else:
+                color = Palette.mix(palette.borders, palette.fg, 0.55)
+            cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
+            cr.set_line_width(1.6 if self.size >= 16 else 1.35)
+            if self.size >= 16:
+                cr.arc(size / 2.0, size / 2.0, size / 2.0 - 0.9, 0, 6.28318)
+            else:
+                self._rounded_rect(cr, 0.8, 0.8, size - 1.6, size - 1.6,
+                                   size * 0.22)
+            cr.stroke()
+        return False
+
+    @staticmethod
+    def _rounded_rect(cr, x, y, width, height, radius):
+        radius = max(0.0, min(radius, width / 2.0, height / 2.0))
+        cr.new_sub_path()
+        cr.arc(x + width - radius, y + radius, radius, -1.5708, 0)
+        cr.arc(x + width - radius, y + height - radius, radius, 0, 1.5708)
+        cr.arc(x + radius, y + height - radius, radius, 1.5708, 3.14159)
+        cr.arc(x + radius, y + radius, radius, 3.14159, 4.71239)
+        cr.close_path()
+
+
+# --------------------------------------------------------------------------- #
+# 一行
+# --------------------------------------------------------------------------- #
+class Row(Gtk.EventBox):
+    """一条待办。点击=勾选、双击=改名、右键=菜单、按住拖=排序。"""
+
+    def __init__(self, app, item):
+        super().__init__()
+        self.app = app
+        self.item_id = item["id"]
+        self.get_style_context().add_class("row")
+        try:
+            self.get_accessible().set_name(tr("待办：%s", "To-do: %s") % item["text"])
+        except Exception:
+            pass
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK
+                        | Gdk.EventMask.ENTER_NOTIFY_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.box.set_margin_start(6)
+        self.box.set_margin_end(8)
+        self.box.set_margin_top(6)
+        self.box.set_margin_bottom(6)
+        self.add(self.box)
+
+        self.check = CheckMark(app, 18, on_click=self._on_check_clicked)
+        self.box.pack_start(self.check, False, False, 0)
+
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.title = Gtk.Label(label=item["text"], xalign=0.0)
+        self.title.set_line_wrap(True)
+        self.title.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.title.get_style_context().add_class("row-title")
+        self.title.set_ellipsize(Pango.EllipsizeMode.NONE)
+        self.body.pack_start(self.title, False, False, 0)
+        self.meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        self.body.pack_start(self.meta, False, False, 0)
+        self.steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        self.body.pack_start(self.steps_box, False, False, 0)
+        self.box.pack_start(self.body, True, True, 0)
+
+        self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        self.steps_btn = icon_button("view-list-symbolic", 14,
+                                     tooltip=tr("子步骤（点文字也可以编辑）", "Sub-steps (click text to edit)"))
+        self.steps_btn.connect("clicked", lambda _b: self.app.begin_steps_edit(self.item_id))
+        self.delete_btn = icon_button("user-trash-symbolic", 14, danger=True,
+                                      tooltip=tr("删除这条", "Delete this"))
+        self.delete_btn.connect("clicked", lambda _b: self.app.remove_item(self.item_id))
+        self.actions.pack_start(self.steps_btn, False, False, 0)
+        self.actions.pack_start(self.delete_btn, False, False, 0)
+        self.box.pack_end(self.actions, False, False, 0)
+        self.actions.set_opacity(0.0)
+
+        self._edit_entry = None
+        self._steps_editor = None
+        self.update_item(item)
+
+        self.connect("enter-notify-event", self._on_enter)
+        self.connect("leave-notify-event", self._on_leave)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+
+    # ---- 内容 ----
+    def update_item(self, item):
+        """就地更新这一行（不重建控件）。"""
+        self.item = item
+        state = self.app.store.state_of(item)
+        done = state == STATE_DONE
+        waiting = state == STATE_WAITING
+        font_context = self.title.get_style_context()
+        for name in ("done", "waiting"):
+            font_context.remove_class(name)
+        if done:
+            font_context.add_class("done")
+        if waiting:
+            font_context.add_class("waiting")
+        if done:
+            self.title.set_markup("<s>%s</s>"
+                                  % GLib.markup_escape_text(item["text"]))
+        else:
+            self.title.set_text(item["text"])
+        self.check.set_state(done=done, waiting=waiting)
+        self._build_meta(item, done=done)
+        self._build_steps(item, done=done)
+        # 子步骤按钮：只有存在子步骤时才明显，没步骤时淡一点（仍可点开空编辑器）
+        steps = self.app.store.steps_of(item)
+        self.steps_btn.set_opacity(0.55 if not steps else 1.0)
+        self.set_tooltip_text(None)
+
+    def _build_meta(self, item, done=False):
+        for child in self.meta.get_children():
+            child.destroy()
+        specs = self.app.meta_specs(item, done=done)
+        if not specs:
+            self.meta.set_no_show_all(True)
+            self.meta.hide()
+            return
+        self.meta.set_no_show_all(False)
+        self.meta.show()
+        for kind, text, extra in specs:
+            if kind == "badge":
+                label = Gtk.Label(label=text)
+                label.get_style_context().add_class("badge")
+                label.get_style_context().add_class(extra)
+                self.meta.pack_start(label, False, False, 0)
+            elif kind == "clock":
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+                image = icon_image("alarm-symbolic", 12)
+                image.get_style_context().add_class("meta")
+                label = Gtk.Label(label=text)
+                label.get_style_context().add_class("meta-strong")
+                box.pack_start(image, False, False, 0)
+                box.pack_start(label, False, False, 0)
+                self.meta.pack_start(box, False, False, 0)
+            elif kind == "tag":
+                label = Gtk.Label(label=text)
+                label.get_style_context().add_class("meta")
+                self.meta.pack_start(label, False, False, 0)
+            else:
+                label = Gtk.Label(label=text)
+                label.get_style_context().add_class("meta")
+                self.meta.pack_start(label, False, False, 0)
+        self.meta.show_all()
+
+    def _build_steps(self, item, done=False):
+        for child in self.steps_box.get_children():
+            child.destroy()
+        steps = self.app.store.steps_of(item)
+        if not steps:
+            self.steps_box.set_no_show_all(True)
+            self.steps_box.hide()
+            return
+        self.steps_box.set_no_show_all(False)
+        self.steps_box.show()
+        for index, step in enumerate(steps):
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            line.set_margin_start(0)
+            check = CheckMark(self.app, 14, done=step["done"],
+                              on_click=lambda idx=index: self.app.toggle_step_item(
+                                  self.item_id, idx))
+            label_box = Gtk.EventBox()
+            label_box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            label = Gtk.Label(label=step["text"], xalign=0.0)
+            label.set_line_wrap(True)
+            label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.get_style_context().add_class("step")
+            if step["done"]:
+                label.set_markup("<s>%s</s>" % GLib.markup_escape_text(step["text"]))
+                label.get_style_context().add_class("done")
+            label_box.add(label)
+            label_box.connect(
+                "button-press-event",
+                lambda _w, event, idx=index: self._on_step_label(event, idx))
+            line.pack_start(check, False, False, 0)
+            line.pack_start(label_box, True, True, 0)
+            self.steps_box.pack_start(line, False, False, 0)
+        self.steps_box.show_all()
+
+    def _on_step_label(self, event, index):
+        if event.button != 1:
+            return False
+        self.app.begin_steps_edit(self.item_id, step_index=index)
+        return True
+
+    # ---- 悬停 ----
+    def _on_enter(self, _widget, _event):
+        self.actions.set_opacity(1.0)
+        return False
+
+    def _on_leave(self, _widget, _event):
+        if self.app.drag_id != self.item_id:
+            self.actions.set_opacity(0.0)
+        return False
+
+    def show_actions(self, visible):
+        self.actions.set_opacity(1.0 if visible else 0.0)
+
+    # ---- 点按 ----
+    def _on_check_clicked(self):
+        self.app.toggle_item(self.item_id)
+
+    def _on_press(self, _widget, event):
+        if event.button == 3:
+            self.app.popup_row_menu(self, event)
+            return True
+        if event.button != 1:
+            return False
+        # 编辑态：点别的行只收掉编辑，不顺手勾选（v0.2.5 的规矩）
+        if self.app.edit_open and self.app.editing_id not in (None, self.item_id):
+            self.app.end_edit_all(save=True)
+            return True
+        if self.app.steps_edit_open and self.app.steps_edit_id != self.item_id:
+            self.app.end_edit_all(save=True)
+            return True
+        # 双击（第二次按下）＝撤回第一次单击的勾选 + 改名，不再触发勾选
+        if self.app.is_double_click(self.item_id):
+            self.app.handle_double_click(self)
+            return True
+        self.app.row_pressed(self, event)
+        return False
+
+    def _on_release(self, _widget, event):
+        if event.button != 1:
+            return False
+        return self.app.row_released(self, event)
+
+    def _on_motion(self, _widget, event):
+        if self.app._press is None:
+            return False
+        self.app.row_motion(self, event)
+        return False
+
+    # ---- 行内改名 ----
+    def begin_edit(self):
+        if self._edit_entry is not None:
+            return
+        item = self.app.find_item(self.item_id)
+        if item is None:
+            return
+        entry = Gtk.Entry()
+        entry.get_style_context().add_class("add")
+        entry.set_text(item["text"] + "".join(" @" + tag for tag in item["tags"]))
+        entry.select_region(0, -1)
+        self.body.pack_start(entry, False, False, 0)
+        self.body.reorder_child(entry, 0)
+        self.title.hide()
+        self._edit_entry = entry
+        entry.show()
+        entry.connect("activate", lambda _e: self.app.end_edit(save=True))
+        entry.connect("key-press-event", self._edit_key)
+        entry.connect("focus-out-event", self._edit_focus_out)
+        entry.grab_focus()
+
+    def _edit_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.app.end_edit(save=False)
+            return True
+        return False
+
+    def _edit_focus_out(self, _widget, _event):
+        # 焦点明确落到别的控件才保存；切到别的应用（无焦点）不算
+        def check():
+            if self._edit_entry is not None:
+                focus = self.app.win.get_focus()
+                if focus is not None and focus is not self._edit_entry:
+                    self.app.end_edit(save=True)
+            return False
+
+        GLib.timeout_add(60, check)
+        return False
+
+    def clear_edit(self):
+        if self._edit_entry is not None:
+            entry, self._edit_entry = self._edit_entry, None
+            try:
+                entry.destroy()
+            except Exception:
+                pass
+        self.title.show()
+
+    def edit_text(self):
+        return self._edit_entry.get_text() if self._edit_entry is not None else ""
+
+    # ---- 子步骤编辑器 ----
+    def begin_steps_edit(self, focus_index=None):
+        if self._steps_editor is not None:
+            if focus_index is not None:
+                self._steps_focus(focus_index)
+            return
+        item = self.app.find_item(self.item_id)
+        if item is None:
+            return
+        steps = self.app.store.steps_of(item)
+        while len(steps) < 1:
+            steps.append({"text": "", "done": False})
+            break
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        holder.set_margin_top(2)
+        self.body.pack_start(holder, False, False, 0)
+        self.body.reorder_child(holder, 2 if self.meta.get_visible() else 1)
+        self.steps_box.hide()
+        entries = []
+        flags = []
+        for step in steps:
+            entries.append(self._steps_make_row(holder, step["text"], step["done"]))
+            flags.append(bool(step["done"]))
+        if steps and steps[-1]["text"]:
+            # 末尾留一个空框，方便直接往下写
+            entries.append(self._steps_make_row(holder, "", False))
+            flags.append(False)
+        holder.show_all()
+        self._steps_editor = {"holder": holder, "entries": entries, "done": flags}
+        self._steps_focus(focus_index or 0)
+        self.app.update_hint()
+
+    def _steps_make_row(self, holder, text, done):
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        check = CheckMark(self.app, 14, done=done,
+                          on_click=lambda: self._steps_toggle_check(check))
+        entry = Gtk.Entry()
+        entry.get_style_context().add_class("add")
+        entry.set_text(text)
+        entry.connect("key-press-event", self._steps_key)
+        entry.connect("focus-in-event",
+                      lambda _w, _e, ent=entry: self._steps_focus_entry(ent))
+        line.pack_start(check, False, False, 0)
+        line.pack_start(entry, True, True, 0)
+        holder.pack_start(line, False, False, 0)
+        line._check = check
+        line._entry = entry
+        return line
+
+    def _steps_toggle_check(self, check):
+        check.set_state(done=not check.done)
+        for index, line in enumerate(self._steps_editor["entries"]):
+            if line._check is check:
+                self._steps_editor["done"][index] = check.done
+                break
+
+    def _steps_key(self, widget, event):
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if event.state & Gdk.ModifierType.CONTROL_MASK:
+                self._steps_add_after(widget)
+            else:
+                self.app.end_steps_edit(save=True)
+            return True
+        if event.keyval == Gdk.KEY_Escape:
+            self.app.end_steps_edit(save=False)
+            return True
+        if event.keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            backward = event.keyval == Gdk.KEY_ISO_Left_Tab \
+                or bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+            self._steps_move_focus(widget, -1 if backward else 1)
+            return True
+        return False
+
+    def _steps_add_after(self, widget):
+        holder = self._steps_editor["holder"]
+        entries = self._steps_editor["entries"]
+        done_flags = self._steps_editor["done"]
+        for index, line in enumerate(entries):
+            if line._entry is widget:
+                new_line = self._steps_make_row(holder, "", False)
+                holder.reorder_child(new_line, index + 1)
+                new_line.show_all()
+                entries.insert(index + 1, new_line)
+                done_flags.insert(index + 1, False)
+                if len(entries) > STEP_MAX:
+                    entries.pop()
+                    new_line.destroy()
+                    self.app.flash_hint("一条最多 %d 个子步骤" % STEP_MAX)
+                    return
+                new_line._entry.grab_focus()
+                self.app.fit_window()
+                return
+
+    def _steps_move_focus(self, widget, delta):
+        entries = [line._entry for line in self._steps_editor["entries"]]
+        try:
+            index = entries.index(widget)
+        except ValueError:
+            return
+        target = max(0, min(len(entries) - 1, index + delta))
+        entries[target].grab_focus()
+
+    def _steps_focus_entry(self, entry):
+        entries = [line._entry for line in self._steps_editor["entries"]]
+        if entry in entries:
+            self.app._steps_active = entries.index(entry)
+
+    def _steps_focus(self, index):
+        if self._steps_editor is None:
+            return
+        entries = self._steps_editor["entries"]
+        if not entries:
+            return
+        index = max(0, min(int(index), len(entries) - 1))
+        entry = entries[index]._entry
+        entry.grab_focus()
+        entry.select_region(0, -1)
+
+    def steps_texts(self):
+        """编辑器里的 (text, done) 列表（空框会被丢掉）。"""
+        if self._steps_editor is None:
+            return []
+        result = []
+        for index, line in enumerate(self._steps_editor["entries"]):
+            text = " ".join(line._entry.get_text().split())
+            if not text:
+                continue
+            result.append({"text": text,
+                           "done": bool(self._steps_editor["done"][index])})
+        return result
+
+    def clear_steps_edit(self):
+        if self._steps_editor is not None:
+            holder = self._steps_editor["holder"]
+            self._steps_editor = None
+            try:
+                holder.destroy()
+            except Exception:
+                pass
+        if not self.steps_box.get_visible():
+            self.steps_box.show()
+
+
+# --------------------------------------------------------------------------- #
+# 主窗口
+# --------------------------------------------------------------------------- #
+class TodoWindow(object):
     """桌面待办面板（无边框、默认不置顶；条目可拖拽排序）。"""
 
     REGROUP_DELAY_MS = 1200       # 状态变了多久之后把它归位（留出双击改名的窗口）
 
-    def _apply_metrics(self, width=None):
-        """按给定宽度（缺省用设计宽度）重算所有跟尺寸有关的量。
-
-        正常启动算出来的数与老实现逐像素一致（这些值都能被自检卡住）；
-        窗口被拉大之后才跟着变宽 —— 换行宽度、右侧图标位置都会跟着变。
-        """
-        scale = self.s
-        panel_w = _scaled(PANEL_W, scale)
-        if width:
-            panel_w = max(panel_w, int(width))
-        self.panel_w = panel_w
-        self.pad = _scaled(PAD, scale)
-        self.list_w = max(1, self.panel_w - 2 * self.pad - 2)
-        self.list_max_h = _scaled(LIST_MAX_H, scale)
-        self.text_x = _scaled(TEXT_X, scale)
-        self.del_w = _scaled(DEL_W, scale)
-        self.wait_w = _scaled(WAIT_W, scale)
-        self.today_w = _scaled(TODAY_W, scale)
-        self.prio_w = _scaled(PRIO_W, scale)
-        self.steps_w = _scaled(STEPS_W, scale)
-        self.step_box = _scaled(STEP_BOX, scale)
-        self.step_indent = _scaled(STEP_INDENT, scale)
-        # 右侧按钮：从右往左排（区名, 宽度）。绘制、点击判定、折行宽度共用这一张表
-        # 右侧只留两个：子步骤（≡ / 2-3）与删除。等待中/今天/优先级搬进右键菜单
-        self.markers = (("delete", self.del_w), ("steps", self.steps_w))
-        self.marker_w = sum(width for _, width in self.markers)
-        self.row_pad_y = _scaled(ROW_PAD_Y, scale)
-        self.row_wrap = max(_scaled(40, scale),
-                            self.list_w - self.text_x - self.marker_w - _scaled(4, scale))
-        self.header_h = _scaled(34, scale)
-        self.icon_box = _scaled(20, scale)
-        self.check_box = _scaled(16, scale)
-
-    def _list_space(self, height=None):
-        """当前窗口高度里最多能给列表多少像素（多出来的高度就多显示几条）。"""
-        try:
-            if height is None:
-                height = self.root.winfo_height()
-            # 卡片高度减去列表高度 = 标题 + 输入框 + 底部 + 间距
-            chrome = self.card.winfo_reqheight() - self.list_area.winfo_reqheight()
-        except (tk.TclError, AttributeError):
-            return _scaled(LIST_MAX_H, self.s)
-        return max(0, int(height) - int(chrome) - self.px(4))
-
-    def _on_root_configure(self, event):
-        """窗口被拉大 / 拉高（WM 边缘拖拽）：防抖之后按新尺寸重排。"""
-        if event.widget is not self.root:
-            return
-        if self._size_job is not None:
-            try:
-                self.root.after_cancel(self._size_job)
-            except (tk.TclError, ValueError):
-                pass
-        try:
-            self._size_job = self.root.after(160, self._apply_resize)
-        except tk.TclError:
-            self._size_job = None
-
-    def _apply_resize(self):
-        """按窗口现在的尺寸重排列宽与列表高度；没变化就不重画（避免来回震荡）。"""
-        self._size_job = None
-        if self.store.ui["collapsed"]:
-            # 折叠时窗口矮是它该有的样子，别当成"用户把窗口拉小了"
-            return
-        if self._steps_edit is not None:
-            # 子步骤编辑器会临时把这一行（和窗口）撑高；那是它自己的动作，
-            # 不是用户改了窗口大小。这里若照常处理会触发 _refresh()，把编辑框连内容一起销毁。
-            return
-        try:
-            width, height = self.root.winfo_width(), self.root.winfo_height()
-        except tk.TclError:
-            return
-        if width <= 1 or height <= 1:
-            return
-        before = (self.panel_w, self.list_max_h)
-        self._apply_metrics(width)
-        space = self._list_space(height)
-        if space > self.list_max_h:
-            self.list_max_h = space
-        if (self.panel_w, self.list_max_h) == before:
-            return
-        self._user_sized = True
-        self.store.ui["width"] = self.panel_w
-        self.store.ui["height"] = height
-        self.store.save()
-        self._refresh()
-
-    def _apply_saved_size(self):
-        """启动时把上次的窗口尺寸装回来（宽度影响排版，高度决定列表能显示几条）。"""
-        width = self.store.ui.get("width")
-        height = self.store.ui.get("height")
-        if not width and not height:
-            return
-        self._apply_metrics(width)
-        if height:
-            self.list_max_h = max(self.list_max_h, self._list_space(height))
-        self._user_sized = True
-        try:                              # 把上次的尺寸真正装回窗口（宽 + 高）
-            self.root.geometry("%dx%d" % (self.panel_w, int(height or self.root.winfo_height())))
-        except tk.TclError:
-            pass
-
-    def __init__(self, root, store, visible=True):
-        self.root = root
+    def __init__(self, win, store, visible=True):
+        self.win = win
         self.store = store
-        # 高 DPI：字号由 Tk 按「点」自动放大，窗口尺寸得按同一比例自己放大
-        self.s = ui_scale(root)
-        # 尺寸相关的量都走 _apply_metrics()：窗口被拉大/拉高之后要能跟着重排
-        self.panel_w = self.pad = self.list_w = self.list_max_h = 0
-        self.text_x = self.del_w = self.wait_w = self.row_pad_y = self.row_wrap = 0
-        self.header_h = self.icon_box = self.check_box = 0
-        self._size_job = None             # 尺寸变化的重排任务（防抖）
-        self._user_sized = False          # 用户手动改过大小：之后不再把它缩回去
-        self._expanded_size = None        # 折叠前的窗口尺寸（展开时还原）
-        self._alpha_dialog = None         # 窗口透明度滑块对话框（开着就复用）
-        self._edit_open_serial = None     # 打开编辑器的那一次点击（同一事件别再当"点别处"）
-        self._apply_metrics(store.ui.get("width"))
-        self.fonts = self._make_fonts()
-        self._drag_offset = None          # 拖窗口的偏移
-        self._placeholder_on = False
-        # 条目拖拽排序状态
-        self.row_widgets = []             # [(item_id, row_canvas)]，按显示顺序
-        self._press = None                # 按下时记录 {id, y_root, zone}
-        self._drag_id = None              # 正在被拖动的条目 id
-        self._drag_target = None          # 拖动中准备落到第几个位置（松手才真挪）
-        self._drop_line = None            # 拖动中的落点标记线（盖在列表上的小横线）
-        self._pointer_y = None            # 拖动中指针的屏幕 y（用于贴边自动滚动）
-        self._autoscroll_job = None
-        # 撤销与编辑状态
-        self._undo = None                 # 刚删掉的 {item, index}，供撤销放回原位
-        self._undo_job = None             # 撤销时限的 after 句柄
-        self._edit_id = None              # 正在编辑的条目 id
-        self._edit_entry = None           # 正在编辑的输入框（盖在那一行上）
-        self._steps_edit = None           # 正在编辑子步骤的 ([每步一个小输入框], 条目 id)
-        self._steps_edit_done = []        # 编辑中的完成标记（跟小输入框一一对应）
-        self._steps_edit_geom = []        # 编辑中每个输入框的 (y, 高度, 小方框中心 y)
-        self._steps_edit_base_h = 0       # 打开编辑器前那一行的行高
-        self._steps_edit_active = None    # 当前聚焦第几个子步骤输入框
-        self._steps_edit_win = None       # 打开编辑器前的窗口尺寸（编辑时临时撑高，收掉要还原）
-        self._steps_edit_grew = False     # 这次编辑有没有把这一行 / 窗口撑高
-        self._last_toggle = (None, 0.0)   # 最近一次勾选（条目 id, 时间），供双击回退
-        self._regroup_job = None          # 归位（按状态分组排序）的待执行任务
-        self._archive_window = None       # 归档浏览器（开着就复用，不重复开窗）
-        self._alert = None                # 正在显示的到点提醒（条目列表）
-        self._hint_job = None             # 临时提示（设/取消提醒后 3 秒恢复常规提示）
-        self._remind_job = None           # 到点提醒的周期检查句柄
+        self.root = GtkRootShim(win)      # 给旧集成代码的 Tk 风格适配层
+        self.panel_w = max(PANEL_W_MIN, min(PANEL_W_MAX,
+                                            int(store.ui.get("width") or PANEL_W)))
+        self._user_sized = bool(store.ui.get("height"))
+        self._done_collapsed = bool(store.ui.get("done_collapsed"))
+        self.filter_tag = None
+        self.filter_query = None
+        self.rows = {}
+        self.row_widgets = []
+        self.section_widgets = {}
+        self.section_counts = {}
+        self._rendering = False
+        self.drag_id = None
+        self.drag_target = None
+        self.drop_line = None
+        self._press = None
+        self._edit_id = None
+        self._steps_edit_id = None
+        self._steps_active = 0
+        self._last_toggle = (None, 0.0)
+        self._last_click = (None, 0.0)
+        # 标题栏拖动状态：必须先在 __init__ 里置空。否则窗口 map 之后、
+        # 用户还没按下鼠标时收到一条 motion/release 事件就会 AttributeError。
+        self._header_drag = None
+        self._header_last_press = None
+        self._regroup_job = None
+        self._undo = None
+        self._undo_job = None
+        self._alert = None
+        self._hint_job = None
+        self._remind_job = None
+        self._archive_window = None
+        self._alpha_dialog = None
+        self._reminder_dialog = None
+        self._row_menu = None
+        self._resize_job = None
+        self._applying_geometry = False
+        self._geometry_pending = None
+        self._geometry_since = 0.0
+        self._anchor_pending = None      # (x, y, width, height)：等 Configure 到位后再挪窗口
+        self._expanded_size = None
+        self._hotkey_spec = store.ui.get("hotkey") or HOTKEY_DEFAULT
+        self._hotkey_on = False
+        self._archived_day = None
+
+        self._migrate_ui()
         self._build()
-        self._restore_position()
-        self._apply_collapsed()
-        self._refresh(keep_scroll=False)
+        self._apply_session_warn()
+        self._restore_geometry()
+        self._refresh_tags()
+        self._archive_on_start()
+        self.render(keep_scroll=False)
         if visible:
-            self.root.deiconify()
-            self.root.update_idletasks()
-            self._restore_position()      # 映射后再落一次，避免 WM 摆放时挪位
-            single_instance_start(self.root, self.raise_window)
-            set_skip_taskbar(self.root)   # 映射后再补一次（KWin 只对已托管的窗口处理）
-            # 全局快捷键：窗口不进任务栏，这是最可靠的唤回入口
-            self._hotkey_spec = self.store.ui.get("hotkey") or HOTKEY_DEFAULT
+            win.show_all()
+            win.present()
+            self._apply_collapsed()
+            self._restore_geometry()
+            single_instance_start(self.root, self.raise_window, self.add_from_ipc)
             set_diag_path(os.path.dirname(self.store.path))
-            self._hotkey_on = hotkey_install(
-                self.root, self._hotkey_spec, self.raise_window)
-            # 先补报「关机/web 没开期间错过」的提醒，再挂上 15 秒一次的周期检查
+            if session_kind()[0] == "wayland":
+                # 纯 Wayland 下 XGrabKey 不可用：不注册，也不假装成功（界面上已有说明）
+                self._hotkey_on = False
+            else:
+                self._hotkey_on = hotkey_install(self.root, self._hotkey_spec,
+                                                 self.raise_window)
             self._remind_tick(raise_it=False)
 
-    # ---- 单实例 / 唤回 ----
-    def raise_window(self, timestamp=None):
-        """把窗口提到最前面并拿到焦点（不改变用户设置的「始终置顶」状态）。
+    def _migrate_ui(self):
+        """把旧版（tkinter 自绘）留下的窗口尺寸收敛到新界面能用的大小。
 
-        `timestamp` 由全局快捷键那一路传进来（KeyPress 事件的时间），EWMH 激活要靠它
-        过 KWin 的防抢焦点；「再跑一次」那一路没有事件，留空即可。
-
-        单实例监听是 unix 套接字 + Tk 文件事件（见 single_instance_start），
-        唤回动作就是下面的 activate_window()。
+        旧版允许把窗口拉成任意宽：升级后若照搬 1174×855，内容列虽然限宽居中，
+        但窗口会伸出屏幕、看点全跑到右边。这里一次性把超宽/超高收掉：
+        宽度收到 520（内容列上限），高度交还给"按内容自适应"，位置重新夹进屏幕。
         """
-        activate_window(self.root, self.store.ui["topmost"], timestamp=timestamp)
-
-    def toggle_hidden(self):
-        """隐藏 / 显示窗口：隐藏之后按全局快捷键唤回（免得和「退出」混在一起）。"""
-        try:
-            viewable = bool(self.root.winfo_viewable())
-            state = ""
+        if getattr(self, "_migrated", False):
+            return
+        self._migrated = True
+        screen_w, screen_h = screen_size()
+        width = int(self.store.ui.get("width") or PANEL_W)
+        height = self.store.ui.get("height")
+        changed = False
+        if width > PANEL_W_MAX:
+            width = PANEL_W_MAX
+            changed = True
+        if width < PANEL_W_MIN:
+            width = PANEL_W_MIN
+            changed = True
+        if height is not None and (int(height) > screen_h * 0.6
+                                   or int(height) < 160):
+            height = None
+            changed = True
+        if changed:
+            self.store.ui["width"] = width
+            self.store.ui["height"] = height
+            x = self.store.ui.get("x")
+            y = self.store.ui.get("y")
+            if x is not None:
+                self.store.ui["x"] = max(0, min(int(x), screen_w - width - 16))
+            if y is not None:
+                self.store.ui["y"] = max(0, min(int(y), screen_h - 120))
             try:
-                state = self.root.state()
-            except tk.TclError:
+                self.store.save()
+            except Exception:
                 pass
-            write_diag("hotkey viewable=%s wm_state=%s -> %s"
-                           % (viewable, state, "withdraw" if viewable else "activate"))
-            if viewable:
-                self.root.withdraw()
-            else:
-                self.raise_window()
-        except tk.TclError as error:
-            write_diag("hotkey 失败: %r" % (error,))
-
-    def open_archive(self):
-        """页头右键 → 查看归档…：打开归档浏览器；已经开着就提到最前，不重复开窗。"""
-        existing = self._archive_window
-        if existing is not None:
-            try:
-                if existing.win.winfo_exists():
-                    existing.show()
-                    return existing
-            except tk.TclError:
-                pass
-        self._archive_window = ArchiveWindow(self, visible=True)
-        return self._archive_window
-
-    # ---- 字体 ----
-    def _make_fonts(self):
-        available = set(tkfont.families())
-        family = None
-        for name in FONT_STACK:
-            if name in available:
-                family = name
-                break
-        base = tkfont.Font(family=family, size=10) if family else tkfont.Font(size=10)
-        actual = base.cget("family")
-        return {
-            "base": base,
-            "bold": tkfont.Font(family=actual, size=10, weight="bold"),
-            "small": tkfont.Font(family=actual, size=9),
-            "done": tkfont.Font(family=actual, size=10, overstrike=1),
-            "marker": tkfont.Font(family=actual, size=8),
-            "small_done": tkfont.Font(family=actual, size=9, overstrike=1),
-        }
+        self.panel_w = width
+        self._user_sized = bool(height)
 
     # ---- 组装 ----
     def _build(self):
-        root = self.root
-        root.title("桌面待办清单")
-        # 窗口交给系统托管（这样点击输入框才能拿到键盘焦点），去标题栏用 Motif 提示、
-        # 「不进任务栏」用 EWMH 的 SKIP_TASKBAR + SKIP_PAGER（见 _on_wm_window 一节）。
-        # 被别的窗口盖住后，按全局快捷键、Alt+Tab 或「再运行一次本程序」都能叫回最前面。
-        root.withdraw()                          # 先不映射，提示才能在首次建图前生效
-        root.attributes("-topmost", bool(self.store.ui["topmost"]))
-        root.attributes("-alpha", float(self.store.ui["alpha"]))
-        root.update_idletasks()                  # 促使 Tk 先建出 toplevel 的窗口
-        strip_window_decorations(root)
-        set_skip_taskbar(root)                   # 任务栏 / dock 里不出现这个图标
-        root.configure(bg=C_BORDER)              # 卡片外层留出 1px 边框色
-        root.protocol("WM_DELETE_WINDOW", self.quit)
+        win = self.win
+        win.set_title(tr("桌面待办清单", "Desktop To-do"))
+        win.set_decorated(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_keep_above(bool(self.store.ui.get("topmost")))
+        set_window_opacity(win, float(self.store.ui.get("alpha") or 0.94))
+        win.set_resizable(True)
+        win.set_default_size(self.panel_w, 420)
+        win.connect("delete-event", lambda *_a: self.quit())
+        win.connect("destroy", lambda *_a: self.quit())
+        win.connect("key-press-event", self._on_window_key)
 
-        self.card = tk.Frame(root, bg=C_CARD, bd=0, highlightthickness=0)
-        self.card.pack(fill="both", expand=True, padx=1, pady=1)
+        screen = Gdk.Screen.get_default()
+        visual = screen.get_rgba_visual() if screen else None
+        if visual is not None and screen.is_composited():
+            win.set_visual(visual)
+        win.set_app_paintable(True)
 
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.card.get_style_context().add_class("card")
+        win.add(self.card)
+        win.connect("configure-event", self._on_configure)
+        win.connect("button-press-event", self._on_window_press)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.clamp = Clamp(self.content, PANEL_W_MAX)
+        self.card.pack_start(self.clamp, True, True, 0)
+
+        self._make_palette()
         self._build_header()
-        self.filter_tag = None            # 顶部情境筛选：None = 看全部
-        # 唤回诊断日志写在"当前数据文件旁边"（自检跑临时目录时就不会碰用户真实数据）
-        set_diag_path(os.path.dirname(self.store.path))
         self._build_input()
-        self._build_tags()
+        self._build_chips()
         self._build_list()
         self._build_footer()
-        self.menu = self._build_menu()
-        self._row_menu = None                  # 当前弹出的条目右键菜单
-        # 只挂左键：右键那一下正是"要弹菜单"的动作，若也挂上全局收起，
-        # 就是"先弹出来、紧接着被同一事件的全局处理收掉"——实测菜单根本弹不出来。
-        # （右键点别的条目由 _popup_row_menu 自己先收起上一个。）
-        self.root.bind_all("<Button-1>", self._dismiss_row_menu, add="+")
-        # 点编辑框以外的任何地方 = 结束编辑并保存（Canvas 默认不抢键盘焦点，
-        # 光靠输入框的 <FocusOut> 点别处是不触发的 —— 结果就是"点别的条目也退不出去"）
-        self.root.bind_all("<Button-1>", self._on_global_click, add="+")
-        self._archived_day = None
-        self._archive_on_start()
+        self._build_window_menu()
+
+    def _apply_session_warn(self):
+        """Wayland 会话下，把「X11 依赖可能失效」写在界面上（不弹窗、不打断）。"""
+        kind, _detail = session_kind()
+        self._session_warn_on = kind in ("wayland", "xwayland")
+        if not self._session_warn_on:
+            return
+        if kind == "wayland":
+            text = "Wayland 会话：全局快捷键 / 置顶可能不可用（本程序为 X11 设计）"
+        else:
+            text = "Wayland 会话（XWayland）：唤回 / 置顶可能不稳定"
+        self.session_warn.set_text(text)
+        self.session_warn.show()
+
+    def _make_palette(self):
+        self.palette = Palette(self.win.get_style_context())
 
     def _build_header(self):
-        self.header = head = tk.Frame(self.card, bg=C_CARD, height=self.header_h)
-        head.pack(fill="x", side="top")
-        head.pack_propagate(False)
+        self.header_event = Gtk.EventBox()
+        self.header_event.set_visible_window(False)
+        self.header_event.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.header.set_margin_start(16)
+        self.header.set_margin_end(10)
+        self.header.set_margin_top(12)
+        self.header.set_margin_bottom(6)
+        self.header_event.add(self.header)
+        self.header_event.connect("button-press-event", self._on_header_press)
+        self.header_event.connect("button-release-event", self._on_header_release)
+        self.header_event.connect("motion-notify-event", self._on_header_motion)
 
-        dot_size = self.px(10)
-        dot = tk.Canvas(head, width=dot_size, height=dot_size, bg=C_CARD,
-                        highlightthickness=0)
-        dot.create_oval(self.px(2), self.px(2), self.px(8), self.px(8),
-                        fill=C_ACCENT, outline="")
-        dot.pack(side="left", padx=(self.pad, self.px(6)))
+        # 展开态：两行（标题 / 计数）
+        self.header_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        self.title = Gtk.Label(label=tr("待办", "To-do"), xalign=0.0)
+        self.title.get_style_context().add_class("title")
+        self.count = Gtk.Label(label="", xalign=0.0)
+        self.count.get_style_context().add_class("subtitle")
+        self.header_left.pack_start(self.title, False, False, 0)
+        self.header_left.pack_start(self.count, False, False, 0)
+        self.header.pack_start(self.header_left, True, True, 0)
 
-        self.title = tk.Label(head, text="待办事项", bg=C_CARD, fg=C_TEXT, font=self.fonts["bold"])
-        self.title.pack(side="left")
+        # 折叠态：单行（标题 + 计数并排），默认不参与 show_all
+        self.compact_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.compact_line.set_no_show_all(True)
+        self.compact_title = Gtk.Label(label=tr("待办", "To-do"), xalign=0.0)
+        self.compact_title.get_style_context().add_class("title-compact")
+        self.compact_count = Gtk.Label(label="", xalign=0.0)
+        self.compact_count.get_style_context().add_class("count-compact")
+        self.compact_line.pack_start(self.compact_title, False, False, 0)
+        self.compact_line.pack_start(self.compact_count, False, False, 0)
+        self.header.pack_start(self.compact_line, True, True, 0)
 
-        self.count = tk.Label(head, text="", bg=C_CARD, fg=C_DIM, font=self.fonts["small"])
-        self.count.pack(side="left", padx=(self.px(8), 0))
+        self.collapse_btn = icon_button("pan-up-symbolic", 15, tooltip=tr("折叠 / 展开", "Collapse / expand"))
+        self.collapse_btn.connect("clicked", lambda _b: self.toggle_collapsed())
+        self.close_btn = icon_button("window-close-symbolic", 15, tooltip=tr("退出", "Quit"))
+        self.close_btn.connect("clicked", lambda _b: self.quit())
+        self.header.pack_end(self.close_btn, False, False, 0)
+        self.header.pack_end(self.collapse_btn, False, False, 0)
 
-        close_btn = self._icon_button(head, "close", self.quit)
-        close_btn.pack(side="right", padx=(0, max(0, self.pad - self.px(6))))
-        self.collapse_btn = self._icon_button(head, "collapse", self.toggle_collapsed)
-        self.collapse_btn.pack(side="right")
-
-        for widget in (head, dot, self.title, self.count):
-            widget.bind("<Button-1>", self._drag_start)
-            widget.bind("<B1-Motion>", self._drag_move)
-            widget.bind("<ButtonRelease-1>", self._drag_end)
-            widget.bind("<Button-3>", self._popup_menu)
-        head.bind("<Double-Button-1>", lambda event: self.toggle_collapsed())
-
-    def _build_tags(self):
-        """顶部情境筛选条：只在有标签时才长出内容（没标签时是个空框，高度≈0）。"""
-        self.tags_row = tk.Frame(self.card, bg=C_CARD)
-        self.tags_row.pack(fill="x", padx=self.pad, pady=(0, self.px(2)))
-
-    def _refresh_tags(self):
-        for child in list(self.tags_row.winfo_children()):
-            child.destroy()
-        tags = self.store.all_tags()
-        if not tags:
-            self.filter_tag = None
-            return
-        self._tag_chip("全部", None)
-        for tag in tags:
-            self._tag_chip("@" + tag, tag)
-
-    def _tag_chip(self, label, tag):
-        active = (self.filter_tag == tag)
-        chip = tk.Label(self.tags_row, text=label, bg=C_LIST,
-                        fg=C_ACCENT if active else C_DIM,
-                        font=self.fonts["small"], padx=self.px(6), pady=self.px(1))
-        chip.pack(side="left", padx=(0, self.px(4)))
-        if active:
-            chip.configure(highlightbackground=C_ACCENT, highlightthickness=1)
-        chip.bind("<Button-1>", lambda event, t=tag: self.set_filter(t))
-        chip.bind("<Enter>", lambda event: chip.configure(fg=C_ACCENT))
-        chip.bind("<Leave>", lambda event: chip.configure(
-            fg=C_ACCENT if active else C_DIM))
-        return chip
-
-    def set_filter(self, tag):
-        """切换「只看某个情境」；tag=None 表示看全部。"""
-        self.filter_tag = tag
-        self._refresh_tags()
-        self._refresh(keep_scroll=False)
-        self._update_counts()
-        self._update_footer()
-
-    def _visible_items(self):
-        if not self.filter_tag:
-            return list(self.store.items)
-        return [item for item in self.store.items
-                if self.filter_tag in self.store.tags_of(item)]
+        self.content.pack_start(self.header_event, False, False, 0)
 
     def _build_input(self):
-        self.input_row = row = tk.Frame(self.card, bg=C_CARD)
+        self.input_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.input_row.set_margin_start(16)
+        self.input_row.set_margin_end(16)
+        self.input_row.set_margin_top(2)
+        self.input_row.set_margin_bottom(8)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text(PLACEHOLDER)
+        self.entry.get_style_context().add_class("add")
+        self.entry.connect("activate", lambda _e: self.add_from_entry())
+        self.entry.connect("key-press-event", self._on_entry_key)
+        self.input_row.pack_start(self.entry, True, True, 0)
+        self.plus_btn = Gtk.Button()
+        self.plus_btn.get_style_context().add_class("plus")
+        self.plus_btn.add(icon_image("list-add-symbolic", 16))
+        self.plus_btn.set_tooltip_text(tr("添加待办", "Add to-do"))
+        self.plus_btn.connect("clicked", lambda _b: self.add_from_entry())
+        self.input_row.pack_end(self.plus_btn, False, False, 0)
+        self.content.pack_start(self.input_row, False, False, 0)
 
-        box = tk.Frame(row, bg=C_LIST, highlightbackground=C_BORDER, highlightthickness=1)
-        box.pack(side="left", fill="x", expand=True)
+    def _build_chips(self):
+        self.tags_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.tags_row.set_margin_start(12)
+        self.tags_row.set_margin_end(12)
+        self.tags_row.set_margin_bottom(4)
+        self.content.pack_start(self.tags_row, False, False, 0)
 
-        self.entry = tk.Entry(box, bg=C_LIST, fg=C_TEXT, insertbackground=C_TEXT,
-                              relief="flat", bd=0, font=self.fonts["base"], highlightthickness=0)
-        self.entry.pack(side="left", fill="x", expand=True, padx=self.px(8), pady=self.px(5))
-        self.entry.bind("<Return>", lambda event: self.add_from_entry())
-        self.entry.bind("<KP_Enter>", lambda event: self.add_from_entry())   # 小键盘回车
-        self.entry.bind("<Escape>", lambda event: self.entry.delete(0, "end"))
-        self.entry.bind("<FocusIn>", lambda event: self._clear_placeholder())
-        self.entry.bind("<FocusOut>", lambda event: self._set_placeholder())
-        self.entry.bind("<Button-1>", self._focus_entry)
-        self._set_placeholder()
-
-        add_btn = tk.Label(row, text="+", bg=C_ACCENT, fg="#ffffff", font=self.fonts["bold"],
-                           width=2, cursor="hand2")
-        add_btn.pack(side="left", padx=(self.px(6), 0), ipady=self.px(5))
-        add_btn.bind("<Button-1>", lambda event: self.add_from_entry())
-        add_btn.bind("<Enter>", lambda event: add_btn.configure(bg="#5aa6ff"))
-        add_btn.bind("<Leave>", lambda event: add_btn.configure(bg=C_ACCENT))
+        # 搜索行（Ctrl+F 或标题栏菜单开关；默认隐藏）
+        self.search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.search_row.set_margin_start(12)
+        self.search_row.set_margin_end(12)
+        self.search_row.set_margin_bottom(4)
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_placeholder_text(tr("搜索待办…", "Search to-dos…"))
+        self.search_entry.connect("changed", self._on_search_changed)
+        self.search_entry.connect("key-press-event", self._on_search_key)
+        self.search_row.pack_start(self.search_entry, True, True, 0)
+        search_close = icon_button("window-close-symbolic", 13,
+                                   tooltip=tr("关闭搜索", "Close search"))
+        search_close.connect("clicked", lambda _b: self.toggle_search(False))
+        self.search_row.pack_end(search_close, False, False, 0)
+        self.search_row.set_no_show_all(True)
+        self.search_row.hide()
+        self.content.pack_start(self.search_row, False, False, 0)
 
     def _build_list(self):
-        self.list_area = tk.Frame(self.card, bg=C_LIST)
-        self.canvas = tk.Canvas(self.list_area, bg=C_LIST, highlightthickness=0, bd=0,
-                                width=self.list_w)
-        self.canvas.pack(fill="x", expand=True)
-        self.inner = tk.Frame(self.canvas, bg=C_LIST)
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.root.bind("<Configure>", self._on_root_configure)
-        self.inner.bind("<Configure>", self._on_inner_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self._bind_wheel(self.canvas)
-        self._bind_wheel(self.inner)
+        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scrolled.set_overlay_scrolling(True)
+        self.scrolled.set_propagate_natural_height(True)
+        self.scrolled.set_max_content_height(420)
+        self.scrolled.set_margin_start(8)
+        self.scrolled.set_margin_end(8)
+        self.listbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.scrolled.add(self.listbox)
+        self.list_area = self.scrolled
+        self.content.pack_start(self.scrolled, True, True, 0)
+        self._bind_wheel(self.scrolled)
+        self._bind_wheel(self.listbox)
 
     def _build_footer(self):
-        self.footer = foot = tk.Frame(self.card, bg=C_CARD)
-        self.hint = tk.Label(foot, text="双击标题可折叠", bg=C_CARD, fg=C_MUTED,
-                             font=self.fonts["small"], anchor="w")
-        self.hint.pack(side="left")
-        # 「撤销」只在刚删掉一条时出现（见 _show_undo / _clear_undo），平时不占位置
-        self.undo_btn = tk.Label(foot, text="撤销删除", bg=C_CARD, fg=C_ACCENT,
-                                 font=self.fonts["small"], cursor="hand2")
-        self.undo_btn.bind("<Button-1>", lambda event: self.undo_delete())
-        self.undo_btn.bind("<Enter>", lambda event: self.undo_btn.configure(fg=C_TEXT))
-        self.undo_btn.bind("<Leave>", lambda event: self.undo_btn.configure(fg=C_ACCENT))
-        # 「知道了」只在到点提醒弹出时出现（见 _show_alert / _dismiss_alert）
-        self.alert_btn = tk.Label(foot, text="知道了", bg=C_CARD, fg=C_WAIT,
-                                  font=self.fonts["small"], cursor="hand2")
-        self.alert_btn.bind("<Button-1>", lambda event: self._dismiss_alert())
-        self.alert_btn.bind("<Enter>", lambda event: self.alert_btn.configure(fg=C_TEXT))
-        self.alert_btn.bind("<Leave>", lambda event: self.alert_btn.configure(fg=C_WAIT))
-        self.clear_btn = tk.Label(foot, text="归档已完成", bg=C_CARD, fg=C_DIM,
-                                  font=self.fonts["small"], cursor="hand2")
-        self.clear_btn.bind("<Button-1>", lambda event: self.clear_done())
-        self.clear_btn.bind("<Enter>", lambda event: self.clear_btn.configure(fg=C_TEXT))
-        self.clear_btn.bind("<Leave>", lambda event: self.clear_btn.configure(fg=C_DIM))
+        self.footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.footer.set_margin_start(16)
+        self.footer.set_margin_end(16)
+        self.footer.set_margin_top(6)
+        self.footer.set_margin_bottom(9)
+        self.hint = Gtk.Label(label="", xalign=0.0)
+        self.hint.get_style_context().add_class("hint")
+        self.hint.set_ellipsize(Pango.EllipsizeMode.END)
+        self.undo_btn = Gtk.Button(label=tr("撤销删除", "Undo delete"))
+        self.undo_btn.get_style_context().add_class("linkbtn")
+        self.undo_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.undo_btn.connect("clicked", lambda _b: self.undo_delete())
+        self.alert_btn = Gtk.Button(label=tr("知道了", "Got it"))
+        self.alert_btn.get_style_context().add_class("linkbtn")
+        self.alert_btn.get_style_context().add_class("warn")
+        self.alert_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.alert_btn.connect("clicked", lambda _b: self.dismiss_alert())
+        self.archive_btn = Gtk.Button(label=tr("归档 0", "Archive 0"))
+        self.archive_btn.get_style_context().add_class("linkbtn")
+        self.archive_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.archive_btn.set_tooltip_text(tr("查看归档", "View archive"))
+        self.archive_btn.connect("clicked", lambda _b: self.open_archive())
+        for widget in (self.undo_btn, self.alert_btn):
+            widget.set_no_show_all(True)
+            widget.hide()
+        self.footer.pack_start(self.hint, True, True, 0)
+        self.footer.pack_start(self.undo_btn, False, False, 0)
+        self.footer.pack_start(self.alert_btn, False, False, 0)
+        self.footer.pack_end(self.archive_btn, False, False, 0)
+        # Wayland 会话提示：只有检测到才显示（见 _apply_session_warn）
+        self.session_warn = Gtk.Label(label="", xalign=0.0)
+        self.session_warn.get_style_context().add_class("hint")
+        self.session_warn.get_style_context().add_class("warn")
+        self.session_warn.set_no_show_all(True)
+        self.session_warn.hide()
+        self.session_warn.set_margin_start(16)
+        self.session_warn.set_margin_end(16)
+        self.content.pack_start(self.session_warn, False, False, 0)
+        self.content.pack_start(self.footer, False, False, 0)
 
-    def _build_menu(self):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="折叠 / 展开", command=self.toggle_collapsed)
-        menu.add_command(label="隐藏窗口（快捷键唤回）", command=self.toggle_hidden)
-        self._topmost_var = tk.BooleanVar(value=bool(self.store.ui["topmost"]))
-        menu.add_checkbutton(label="始终置顶", variable=self._topmost_var, command=self._apply_topmost)
-        # 装的是 .deb 时，用户根本不会去终端敲 --install-autostart；这里给它一个开关
-        self._autostart_var = tk.BooleanVar(value=os.path.exists(autostart_path()))
-        menu.add_checkbutton(label="开机自启", variable=self._autostart_var,
-                             command=self._toggle_autostart)
-        menu.add_command(label="窗口透明度…", command=self.open_alpha_dialog)
-        menu.add_separator()
-        menu.add_command(label="查看归档…", command=self.open_archive)
-        menu.add_separator()
-        menu.add_command(label="退出", command=self.quit)
-        return menu
+    def _build_window_menu(self):
+        self.window_menu = Gtk.Menu()
+        item = Gtk.MenuItem(label=tr("折叠 / 展开", "Collapse / expand"))
+        item.connect("activate", lambda _i: self.toggle_collapsed())
+        self.window_menu.append(item)
+        item = Gtk.MenuItem(label=tr("隐藏窗口（快捷键唤回）", "Hide window (recall by hotkey)"))
+        item.connect("activate", lambda _i: self.toggle_hidden())
+        self.window_menu.append(item)
+        self._topmost_item = Gtk.CheckMenuItem(label=tr("始终置顶", "Always on top"))
+        self._topmost_item.set_active(bool(self.store.ui.get("topmost")))
+        self._topmost_item.connect("toggled", self._on_topmost_toggled)
+        self.window_menu.append(self._topmost_item)
+        self._autostart_item = Gtk.CheckMenuItem(label=tr("开机自启", "Start on login"))
+        self._autostart_item.set_active(os.path.exists(autostart_path()))
+        self._autostart_item.connect("toggled", self._on_autostart_toggled)
+        self.window_menu.append(self._autostart_item)
+        item = Gtk.MenuItem(label=tr("窗口透明度…", "Window opacity…"))
+        item.connect("activate", lambda _i: self.open_alpha_dialog())
+        self.window_menu.append(item)
+        self._sound_item = Gtk.CheckMenuItem(label=tr("提醒声音", "Reminder sound"))
+        self._sound_item.set_active(bool(self.store.ui.get("sound", True)))
+        self._sound_item.connect("toggled", self._on_sound_toggled)
+        self.window_menu.append(self._sound_item)
+        self.window_menu.append(Gtk.SeparatorMenuItem())
+        item = Gtk.MenuItem(label=tr("查看归档…", "View archive…"))
+        item.connect("activate", lambda _i: self.open_archive())
+        self.window_menu.append(item)
+        self.window_menu.append(Gtk.SeparatorMenuItem())
+        item = Gtk.MenuItem(label=tr("退出", "Quit"))
+        item.connect("activate", lambda _i: self.quit())
+        self.window_menu.append(item)
+        self.window_menu.show_all()
 
-    # ---- 小控件 ----
-    def px(self, value):
-        """基准像素值 → 当前缩放下的像素值（缩放 1.0 时原样返回）。"""
-        return _scaled(value, self.s)
+    # ---- 数据/可见集 ----
+    def _visible_items(self):
+        items = self.store.items
+        if self.filter_tag:
+            items = [item for item in items
+                     if self.filter_tag in self.store.tags_of(item)]
+        if self.filter_query:
+            query = self.filter_query.casefold()
+            items = [item for item in items if query in item["text"].casefold()]
+        return items
 
-    def _icon_button(self, parent, kind, command):
-        canvas = tk.Canvas(parent, width=self.icon_box, height=self.icon_box, bg=C_CARD,
-                           highlightthickness=0, cursor="hand2")
-        canvas._kind = kind
-        self._draw_icon(canvas, kind, C_DIM)
-        canvas.bind("<Button-1>", lambda event: command())
-        canvas.bind("<Enter>", lambda event: self._draw_icon(canvas, kind, C_TEXT))
-        canvas.bind("<Leave>", lambda event: self._draw_icon(canvas, kind, C_DIM))
-        return canvas
+    def find_item(self, item_id):
+        for item in self.store.items:
+            if item["id"] == item_id:
+                return item
+        return None
 
-    def _draw_icon(self, canvas, kind, color):
-        canvas.delete("all")
-        line_w = 1.6 * self.s
-        if kind == "close":
-            canvas.create_line(self.px(6), self.px(6), self.px(14), self.px(14),
-                               fill=color, width=line_w, capstyle="round")
-            canvas.create_line(self.px(14), self.px(6), self.px(6), self.px(14),
-                               fill=color, width=line_w, capstyle="round")
-        else:  # 折叠箭头：展开时朝下，折叠时朝右
-            if self.store.ui["collapsed"]:
-                canvas.create_line(self.px(8), self.px(5), self.px(13), self.px(10),
-                                   self.px(8), self.px(15), fill=color, width=line_w,
-                                   capstyle="round", joinstyle="round")
-            else:
-                canvas.create_line(self.px(5), self.px(8), self.px(10), self.px(13),
-                                   self.px(15), self.px(8), fill=color, width=line_w,
-                                   capstyle="round", joinstyle="round")
+    def meta_specs(self, item, done=False):
+        """元信息行：时钟 + @标签 + 已/总步数 + 徽标（高/中/今天）+ 等待备注。"""
+        specs = []
+        if not done and item.get("remind_at"):
+            specs.append(("clock", format_remind_time(item["remind_at"]), None))
+        for tag in self.store.tags_of(item):
+            specs.append(("tag", "@" + tag, None))
+        done_steps, total_steps = self.store.steps_progress(item)
+        if total_steps:
+            specs.append(("meta", tr("%d/%d 步", "%d/%d steps") % (done_steps, total_steps), None))
+        if not done:
+            priority = self.store.priority_of(item)
+            if priority == PRIORITY_HIGH:
+                specs.append(("badge", tr("高", "High"), "hi"))
+            elif priority == PRIORITY_MID:
+                specs.append(("badge", tr("中", "Mid"), "mid"))
+            if item.get("today"):
+                specs.append(("badge", tr("今天", "Today"), "today"))
+        return specs
 
-    def _draw_check(self, canvas, done, top=0):
-        """在 canvas 上画勾选框，top 为垂直偏移（尺寸按界面缩放）。"""
-        canvas.delete("check")
-        y = top
-        box = self.check_box
-        if done:
-            canvas.create_rectangle(self.px(6), y, self.px(22), y + box, fill=C_ACCENT,
-                                    outline="", tags="check")
-            canvas.create_line(self.px(10), y + self.px(8), self.px(13), y + self.px(11.5),
-                               self.px(18.5), y + self.px(4.5), fill="#ffffff",
-                               width=2 * self.s, capstyle="round", joinstyle="round",
-                               tags="check")
-        else:
-            canvas.create_rectangle(self.px(6.5), y + 0.5, self.px(21.5), y + box - 0.5,
-                                    outline=C_BORDER, width=1.4 * self.s, tags="check")
-
-    def _bind_wheel(self, widget):
-        widget.bind("<Button-4>", self._on_wheel)
-        widget.bind("<Button-5>", self._on_wheel)
-        widget.bind("<MouseWheel>", self._on_wheel)
-
-    def _on_wheel(self, event):
-        if self.inner.winfo_reqheight() <= self.list_max_h:
-            return "break"
-        up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
-        self.canvas.yview_scroll(-2 if up else 2, "units")
-        return "break"
-
-    # ---- 输入框占位文字 ----
-    def _set_placeholder(self):
-        if not self.entry.get():
-            self._placeholder_on = True
-            self.entry.insert(0, PLACEHOLDER)
-            self.entry.configure(fg=C_MUTED)
-
-    def _clear_placeholder(self):
-        """清掉占位文字，只删占位本身——用户已经敲进去的字一个都不能丢。"""
-        if not self._placeholder_on:
-            return
-        self._placeholder_on = False
-        text = self.entry.get()
-        if text != PLACEHOLDER and PLACEHOLDER in text:
-            self.entry.delete(0, "end")
-            self.entry.insert(0, text.replace(PLACEHOLDER, ""))
-        elif text == PLACEHOLDER:
-            self.entry.delete(0, "end")
-        self.entry.configure(fg=C_TEXT)
-
-    def _focus_entry(self, event=None):
-        if self._placeholder_on:
-            # 第一次点进来：先删掉提示文字并吞掉这次点击，光标落到文字末尾，
-            # 否则默认行为会把插入点放进提示文字中间，打字就打进提示里了。
-            self._clear_placeholder()
-            self.entry.icursor("end")
-            self.entry.focus_force()      # 同步拿焦点，紧接着的第一次按键不能丢
-            return "break"
-        self.entry.focus_force()
-
-    # ---- 列表刷新 ----
-    def _refresh(self, keep_scroll=True):
-        if self._steps_edit is not None:
-            # 子步骤编辑器还开着就整表重建，会把正在输入的内容一起吞掉（它会重建行控件）。
-            # 先按"保存"把它收掉；_end_steps_edit 自己会再调一次 _refresh。
-            self._end_steps_edit(save=True)
-            return
+    # ---- 渲染 ----
+    def render(self, keep_scroll=True):
+        """整表重建（只在结构变化时调用；单条状态变化走 redraw_row）。"""
+        self._rendering = True
         try:
-            position = self.canvas.yview()[0] if keep_scroll else 0.0
-        except tk.TclError:
-            position = 0.0
+            if self._steps_edit_id is not None:
+                self.end_steps_edit(save=True)
+            self._render_body(keep_scroll)
+        finally:
+            self._rendering = False
 
-        for child in list(self.inner.winfo_children()):
+    def _render_body(self, keep_scroll):
+        position = 0.0
+        if keep_scroll:
+            try:
+                position = self.scrolled.get_vadjustment().get_value()
+            except Exception:
+                position = 0.0
+        self.end_edit(save=False, silend=True)
+        for child in self.listbox.get_children():
             child.destroy()
-        # 行会被重建，正在编辑的输入框随之销毁，别留悬空引用
-        self._edit_id = None
-        self._edit_entry = None
-        self._steps_edit = None
-        self._steps_edit_done = []
-        self._steps_edit_geom = []
-        self._steps_edit_base_h = 0
-        self._steps_edit_active = None
-        self._steps_edit_win = None
-        self._steps_edit_grew = False
+        self.rows = {}
         self.row_widgets = []
-        self._press = None
-        self._drag_id = None
-        self._pointer_y = None
-        self._stop_autoscroll()
-
+        self.section_widgets = {}
+        self.section_widgets = {}
+        self.listbox.show()
         visible = self._visible_items()
         if not visible:
-            empty = tk.Label(self.inner,
-                             text=("没有 @%s 的条目" % self.filter_tag) if self.filter_tag
-                             else "暂无待办，在上面输入框添加第一条",
-                             bg=C_LIST, fg=C_MUTED, font=self.fonts["small"])
-            empty.pack(fill="x", pady=self.px(20))
-            self._bind_wheel(empty)
+            self._make_empty_state()
         else:
-            for item in visible:
-                self._make_row(item)
-
+            for state in STATE_ORDER:
+                group = [item for item in visible
+                         if self.store.state_of(item) == state]
+                if not group:
+                    continue
+                collapsed = state == STATE_DONE and self._done_collapsed
+                self.section_widgets[state] = self._make_section(
+                    state, len(group), collapsed=collapsed)
+                if not collapsed:
+                    for item in group:
+                        row = Row(self, item)
+                        self.rows[item["id"]] = row
+                        self.row_widgets.append((item["id"], row))
+                        self.listbox.pack_start(row, False, False, 0)
+        self.listbox.show_all()
         self._update_counts()
         self._update_footer()
-        self.root.update_idletasks()
-        self._resize()
-        if self.inner.winfo_reqheight() > self.list_max_h:
-            self.canvas.yview_moveto(position)
-        else:
-            self.canvas.yview_moveto(0.0)
-
-    def _wrap_text(self, text, font, limit):
-        """按像素宽度折行（Tk 的 Label 折行在本机渲染不齐，这里自己算）。"""
-        lines = []
-        for paragraph in str(text).split("\n"):
-            current = ""
-            for char in paragraph:
-                if current and font.measure(current + char) > limit:
-                    lines.append(current.rstrip())
-                    current = "" if char == " " else char
-                else:
-                    current += char
-            lines.append(current.rstrip())
-        return [line for line in lines if line] or [""]
-
-    def _draw_row(self, canvas, item):
-        """把一条待办画进行画布（新建与原地重画共用）。
-
-        视觉上的几个维度：
-          状态：未完成＝白字空方框；等待中＝琥珀字；已完成＝灰字删除线 + 蓝勾；
-          优先级：行最左侧竖条（橙红＝高、金黄＝中；高＝整行、中＝半行）；
-          今天：正文前的蓝点；提醒：正文最后一行行尾的琥珀色 ⏰ 时间；
-          删除：最右边那个 ×。
-
-        返回 (删除按钮的图元 id, 行高)；行高变化时会同步 canvas 的 height。
-        """
-        canvas.delete("all")
-        state = self.store.state_of(item)
-        done = state == STATE_DONE
-        canvas._waiting = state == STATE_WAITING
-        canvas._prio = self.store.priority_of(item)
-        canvas._today = bool(item.get("today"))
-        font = self.fonts["done"] if done else self.fonts["base"]
-        line_h = font.metrics("linespace")
-        steps = self.store.steps_of(item)
-        done_steps, total_steps = self.store.steps_progress(item)
-        tags = self.store.tags_of(item)
-        tag_text = " ".join("@" + tag for tag in tags)
-        tag_font = self.fonts["marker"]
-        tag_w = (tag_font.measure(tag_text) + self.px(6)) if tag_text else 0
-        when = item.get("remind_at")
-        remind_text = ("⏰" + format_remind_time(when)) if when else ""
-        remind_w = (tag_font.measure(remind_text) + self.px(6)) if remind_text else 0
-        lines = self._wrap_text(item["text"], font,
-                               max(self.px(40), self.row_wrap - tag_w - remind_w))
-        extras_w = tag_w + remind_w
-        extras_newline = bool(extras_w) and \
-            font.measure(lines[-1]) + extras_w > self.row_wrap
-        if extras_newline:
-            lines = self._wrap_text(item["text"], font,
-                                   max(self.px(40), self.row_wrap))
-        step_h = self.fonts["small"].metrics("linespace") + self.px(2)
-        step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
-        step_rows = 0
-        for step in steps:
-            step_font = self.fonts["small_done"] if step["done"] else self.fonts["small"]
-            step_rows += len(self._wrap_text(step["text"], step_font, step_wrap))
-        main_h = line_h * (len(lines) + (1 if extras_newline else 0))
-        canvas._main_h = main_h        # 双击改标题时输入框只盖这一块
-        row_h = main_h + step_h * step_rows + 2 * self.row_pad_y
-        if int(canvas.cget("height")) != row_h:
-            canvas.configure(height=row_h)
-
-        # 优先级：行最左边一条竖条（高＝整条、中＝中间半条）。不占正文宽度
-        if canvas._prio in (PRIORITY_HIGH, PRIORITY_MID):
-            bar_w = max(2.0, self.px(3))
-            if canvas._prio == PRIORITY_HIGH:
-                bar_top, bar_bottom = 0.0, float(row_h)
-            else:
-                bar_top, bar_bottom = row_h * 0.25, row_h * 0.75
-            canvas.create_rectangle(
-                0, bar_top, bar_w, bar_bottom,
-                fill=C_HIGH if canvas._prio == PRIORITY_HIGH else C_MID,
-                outline="", tags="prio")
-        # 今天：正文前面的小蓝点（在勾选框与文字之间的空档里，也不占宽度）
-        if canvas._today:
-            dot = max(2.0, self.px(3))
-            dot_x, dot_y = self.text_x - self.px(8), self.row_pad_y + line_h / 2.0
-            canvas.create_oval(dot_x - dot, dot_y - dot, dot_x + dot, dot_y + dot,
-                               fill=C_ACCENT, outline="", tags="today")
-
-        # 主勾选框对齐「主文字块」而不是整行：有子步骤时不会跑到中间去
-        self._draw_check(canvas, done,
-                         top=self.row_pad_y + (main_h - self.check_box) // 2)
-        text_color = C_DONE if done else (C_WAIT if canvas._waiting else C_TEXT)
-        for index, line in enumerate(lines):
-            canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
-                               anchor="nw", fill=text_color, font=font, tags="text")
-        canvas._remind_item = None
-        canvas._tag_item = None
-        if lines:
-            if extras_newline:
-                extra_x = self.text_x
-                extra_line = len(lines)
-            else:
-                extra_x = self.text_x + font.measure(lines[-1]) + self.px(6)
-                extra_line = len(lines) - 1
-            line_y = self.row_pad_y + extra_line * line_h + line_h / 2.0
-            if remind_text:
-                remind_color = C_DANGER if when < time.time() else C_WAIT
-                canvas._remind_item = canvas.create_text(
-                    extra_x, line_y, text=remind_text, anchor="w",
-                    fill=remind_color, font=tag_font, tags="remind")
-                extra_x += tag_font.measure(remind_text) + self.px(6)
-            if tag_text and extra_x + tag_font.measure(tag_text) <=                     self.text_x + self.row_wrap:
-                canvas._tag_item = canvas.create_text(
-                    extra_x, line_y, text=tag_text, anchor="w",
-                    fill=C_ACCENT, font=tag_font, tags="tag")
-        canvas._step_boxes = self._draw_steps(canvas, steps, self.row_pad_y + main_h, step_h)
-        canvas._steps_done, canvas._steps_total = done_steps, total_steps
-        canvas._markers = {
-            "delete": self._draw_delete_marker(canvas, row_h),
-            "steps": self._draw_steps_marker(canvas, row_h, done_steps, total_steps),
-        }
-        canvas._delete_item = canvas._markers["delete"][0][0]   # 兼容旧引用
-        self._paint_markers(canvas, None)
-        return canvas._delete_item, row_h
-
-    def _draw_step_check(self, canvas, left, cy, done, tags="step"):
-        """在 (left, cy) 画一个子步骤小方框（勾选/未勾选），返回图元 id 列表。
-
-        列表排版和子步骤编辑器共用这一份，两边的小方框长得一模一样。
-        """
-        box = self.step_box
-        bx0, by0 = left, cy - box / 2.0
-        bx1, by1 = left + box, cy + box / 2.0
-        if done:
-            ids = [canvas.create_rectangle(bx0, by0, bx1, by1, fill=C_ACCENT,
-                                           outline="", tags=tags)]
-            ids.append(canvas.create_line(bx0 + box * 0.22, by0 + box * 0.52,
-                                          bx0 + box * 0.44, by0 + box * 0.74,
-                                          bx0 + box * 0.80, by0 + box * 0.26,
-                                          fill="#ffffff", width=max(1.0, 1.6 * self.s),
-                                          capstyle="round", joinstyle="round",
-                                          tags=tags))
-            return ids
-        return [canvas.create_rectangle(bx0, by0, bx1, by1, outline=C_BORDER,
-                                        width=max(1.0, 1.2 * self.s), tags=tags)]
-
-    def _draw_steps(self, canvas, steps, top, step_h):
-        """在主文字下面逐行画子步骤，返回每行小方框的命中区。
-
-        返回 [(index, y0, y1, x0, x1)]（canvas 坐标）。点小方框 = 勾这个步骤；
-        点这一行的其它地方什么也不做 —— 免得误把整条待办标成完成。
-        """
-        boxes = []
-        step_font = self.fonts["small"]
-        step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
-        step_h = step_h * 1.0
-        y = top
-        for index, step in enumerate(steps):
-            font = self.fonts["small_done"] if step["done"] else step_font
-            text_lines = self._wrap_text(step["text"], font, step_wrap)
-            block_h = step_h * len(text_lines)
-            y0 = y
-            cy = y0 + step_h / 2.0
-            self._draw_step_check(canvas, self.text_x, cy, step["done"], tags="step")
-            for line_index, line in enumerate(text_lines):
-                canvas.create_text(self.text_x + self.step_indent,
-                                   y0 + line_index * step_h,
-                                   text=line, anchor="nw",
-                                   fill=C_DONE if step["done"] else C_DIM,
-                                   font=font, tags="step")
-            bx0 = self.text_x
-            bx1 = self.text_x + self.step_box
-            boxes.append((index, y0, y0 + block_h,
-                          bx0 - self.px(3), bx1 + self.px(4)))
-            y += block_h
-        canvas._step_top = top
-        return boxes
-
-    # ---- 右侧按钮：位置、绘制、上色 ----
-    def _marker_center(self, zone, row_h):
-        """某个右侧按钮的中心坐标（按钮从右往左排）。"""
-        right = self.list_w
-        for name, width in self.markers:
-            if name == zone:
-                return right - width / 2.0, row_h // 2.0 + self.px(1)
-            right -= width
-        return right, row_h // 2.0 + self.px(1)
-
-    def _marker_zone_start(self):
-        """右侧按钮区的左边界（点击落在这右边就不算"点条目本身"）。"""
-        return self.list_w - self.marker_w
-
-    def _zone_at(self, x):
-        """x 落在哪个右侧按钮上；不在按钮区返回 None。"""
-        right = self.list_w
-        for name, width in self.markers:
-            if x >= right - width:
-                return name
-            right -= width
-        return None
-
-    def _draw_steps_marker(self, canvas, row_h, done, total):
-        """「子步骤」按钮：没有子步骤时画 ≡，有子步骤时画 已完成/总数。"""
-        cx, cy = self._marker_center("steps", row_h)
-        text = ("%d/%d" % (done, total)) if total else "≡"
-        text_id = canvas.create_text(cx, cy, text=text, fill=C_MUTED,
-                                     font=self.fonts["marker"], tags="marker")
-        return ((text_id, "text"),)
-
-    def _draw_delete_marker(self, canvas, row_h):
-        """删除按钮：×（原来那个位置和判定都没变）。"""
-        cx, cy = self._marker_center("delete", row_h)
-        text_id = canvas.create_text(cx, cy, text="×", fill=C_MUTED,
-                                     font=self.fonts["bold"], tags="marker")
-        return ((text_id, "text"),)
-
-    def _colorize(self, canvas, items, color, filled=False):
-        """给一组图元上色：圆环改 outline、三角旗改 outline+fill、其余改 fill。"""
-        for item_id, kind in items:
+        self._refresh_tags()
+        self.fit_window()
+        if keep_scroll and position:
             try:
-                if kind == "oval":
-                    canvas.itemconfigure(item_id, outline=color)
-                elif kind == "poly":
-                    canvas.itemconfigure(item_id, outline=color,
-                                         fill=color if filled else "")
-                else:
-                    canvas.itemconfigure(item_id, fill=color)
-            except tk.TclError:
-                return
+                adjustment = self.scrolled.get_vadjustment()
+                GLib.idle_add(lambda: (adjustment.set_value(position), False)[1])
+            except Exception:
+                pass
 
-    def _paint_markers(self, canvas, hover_zone):
-        """给右侧两个按钮上色（子步骤格：无步骤＝≡灰、部分＝暗、全完成＝强调色）。"""
-        markers = getattr(canvas, "_markers", None)
-        if not markers:
-            return
-        total = getattr(canvas, "_steps_total", 0)
-        done = getattr(canvas, "_steps_done", 0)
-        if not total:
-            color = C_MUTED
-        elif done >= total:
-            color = C_ACCENT
-        else:
-            color = C_DIM
-        if hover_zone == "steps":
-            color = C_ACCENT
-        self._colorize(canvas, markers["steps"], color)
-        self._colorize(canvas, markers["delete"],
-                       C_DANGER if hover_zone == "delete" else C_MUTED)
-
-    def _redraw_row(self, item_id):
-        """只重画这一行（原地更新），不重建控件。
-
-        勾选以前是 store.toggle() 后 _refresh() 整表重建；而 Tk 判定双击要求两次点击
-        落在同一个控件上——重建后第二次点击只能算「新控件上的单击」，于是
-        <Double-Button-1> 永远不触发，双击改文字在真机上永远进不去。
-        改成原地重画之后，行控件活下来，双击才能按文档那样工作。
-        """
-        widget = self._row_widget(item_id)
-        item = self._find_item(item_id)
-        if widget is None or item is None:
+    def redraw_row(self, item_id):
+        """只更新这一行（不重建控件）。"""
+        row = self.rows.get(item_id)
+        item = self.find_item(item_id)
+        if row is None or item is None:
             return False
-        if self._edit_entry is not None and self._edit_id == item_id:
-            return False                     # 正在编辑这一行，别把它盖掉
-        if self._steps_edit is not None and self._steps_edit[1] == item_id:
-            return False                     # 正在编辑子步骤，同理
-        before = int(widget.cget("height"))
-        self._draw_row(widget, item)
-        if int(widget.cget("height")) != before:
-            self.root.update_idletasks()
-            self._resize()                   # 行高变了才需要重排窗口高度
+        if self._steps_edit_id == item_id or self._edit_id == item_id:
+            return False
+        row.update_item(item)
         return True
 
-    def _make_row(self, item):
-        row = tk.Canvas(self.inner, bg=C_LIST, highlightthickness=0, bd=0,
-                        width=self.list_w, height=self.px(20), cursor="hand2")
-        row.pack(fill="x")
-        self._draw_row(row, item)
+    def _make_section(self, state, count, collapsed=False):
+        wrap = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        wrap.set_margin_start(6)
+        wrap.set_margin_end(6)
+        wrap.set_margin_top(12)
+        wrap.set_margin_bottom(2)
+        name = Gtk.Label(label={STATE_TODO: tr("未完成", "Not done"),
+                                STATE_WAITING: tr("等待中", "Waiting"),
+                                STATE_DONE: tr("已完成", "Done")}.get(state, state),
+                         xalign=0.0)
+        name.get_style_context().add_class("section")
+        num = Gtk.Label(label=str(count), xalign=0.0)
+        num.get_style_context().add_class("section-count")
+        self.section_counts[state] = num
+        wrap.pack_start(name, False, False, 0)
+        wrap.pack_start(num, False, False, 0)
+        if state == STATE_DONE:
+            if not collapsed:
+                clear = Gtk.Button(label=tr("归档已完成", "Archive completed"))
+                clear.get_style_context().add_class("linkbtn")
+                clear.set_relief(Gtk.ReliefStyle.NONE)
+                clear.set_tooltip_text(tr("把所有已完成的条目移进归档",
+                                                "Move all completed items to the archive"))
+                clear.connect("clicked", lambda _b: self.clear_done())
+                wrap.pack_end(clear, False, False, 0)
+            arrow = icon_button("pan-down-symbolic" if not collapsed
+                                else "pan-end-symbolic", 13,
+                                tooltip=tr("折叠 / 展开已完成", "Collapse / expand completed"))
+            arrow.connect("clicked", lambda _b: self.toggle_done_collapsed())
+            wrap.pack_end(arrow, False, False, 0)
+        self.listbox.pack_start(wrap, False, False, 0)
+        return wrap
 
-        item_id = item["id"]
+    def _make_empty_state(self):
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        wrap.set_margin_top(30)
+        wrap.set_margin_bottom(30)
+        image = icon_image("view-list-symbolic", 28)
+        image.get_style_context().add_class("empty-sub")
+        wrap.pack_start(image, False, False, 0)
+        if self.filter_tag:
+            headline = "没有 @%s 的条目" % self.filter_tag
+            sub = "点上面的「全部」看所有待办"
+        else:
+            headline = tr("还没有待办", "No to-dos yet")
+            sub = tr("在上面写一条，回车就记下了",
+                     "Type one above and press Enter")
+        head = Gtk.Label(label=headline)
+        head.get_style_context().add_class("empty-title")
+        tail = Gtk.Label(label=sub)
+        tail.get_style_context().add_class("empty-sub")
+        wrap.pack_start(head, False, False, 0)
+        wrap.pack_start(tail, False, False, 0)
+        self.listbox.pack_start(wrap, False, False, 0)
 
-        def on_motion(event):
-            self._paint_markers(row, self._zone_at(event.x))
+    # ---- 尺寸 ----
+    def chrome_height(self):
+        total = 0
+        for widget in (self.header, self.input_row, self.tags_row,
+                       self.search_row, self.session_warn, self.footer):
+            if widget is not None and widget.get_visible():
+                minimum, _natural = widget.get_preferred_height()
+                total += minimum
+        return total
 
-        def on_leave(event):
-            self._paint_markers(row, None)
-
-        row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
-        row.bind("<B1-Motion>", self._row_motion)
-        row.bind("<ButtonRelease-1>", self._row_release)
-        row.bind("<Double-Button-1>", lambda event, i=item_id: self._begin_edit(i, event))
-        row.bind("<Button-3>", lambda event, i=item_id: self._popup_row_menu(event, i))
-        row.bind("<Motion>", on_motion)
-        row.bind("<Leave>", on_leave)
-        self._bind_wheel(row)
-
-        self.row_widgets.append((item_id, row))
-
-    # ---- 条目拖拽排序 ----
-    def _row_press(self, event, item_id):
-        """记住按下的位置：右侧按钮各自成区，子步骤小方框单独成区，其余当"点条目本身"。"""
-        zone, step = self._zone_at(event.x), None
-        event_y = getattr(event, "y", 0)
-        widget = self._row_widget(item_id)
-        editor = self._steps_edit
-        if editor is not None and editor[1] == item_id and widget is not None:
-            # 子步骤编辑中：小方框单独成区（点它＝勾这一步），输入框之间的缝隙 / 左边
-            # 小方框列算"编辑区"，点它只是把焦点挪到最近的输入框，不会误把主条目标完成。
-            index = self._steps_edit_check_at(event.x, event_y)
-            if index is not None:
-                self._press = {"id": item_id, "y": event.y_root,
-                               "zone": "steps-edit-check", "step": index}
-            elif event_y >= getattr(widget, "_step_top", 1e9):
-                self._press = {"id": item_id, "y": event.y_root,
-                               "zone": "steps-edit-area",
-                               "step": self._steps_edit_nearest(event_y)}
-            else:
-                self._press = {"id": item_id, "y": event.y_root, "zone": "body"}
+    def fit_window(self):
+        """按内容算窗口高度；列表超上限就滚动。用户手动定过高度就以用户为准。"""
+        if self.store.ui.get("collapsed"):
             return
-        if zone is None and widget is not None:
-            for index, y0, y1, x0, x1 in getattr(widget, "_step_boxes", None) or []:
-                if x0 <= event.x <= x1 and y0 <= event_y <= y1:
-                    zone, step = "step", index
-                    break
-            if zone is None and event_y >= getattr(widget, "_step_top", 1e9):
-                zone = "step-area"        # 子步骤那一行（但不是小方框）：什么也不做
-        self._press = {"id": item_id, "y": event.y_root, "zone": zone or "body",
-                       "step": step}
+        _screen_w, screen_h = screen_size()
+        chrome = self.chrome_height()
+        self.scrolled.set_max_content_height(
+            int(max(120, screen_h * LIST_MAX_RATIO - chrome)))
+        # 内容列最宽 520（Clamp 负责居中），但窗口本身可以拉得更宽
+        content_w = min(self.panel_w, PANEL_W_MAX)
+        if self._user_sized and self.store.ui.get("height"):
+            height = int(self.store.ui["height"])
+        else:
+            _minimum, list_natural = self.scrolled.get_preferred_height_for_width(
+                max(120, content_w - 18))
+            height = chrome + min(list_natural, int(screen_h * LIST_MAX_RATIO)) + 8
+        self._apply_geometry(self.panel_w, max(140, int(height)))
 
-    def _row_motion(self, event):
-        if self._press is None:
-            return
-        self._pointer_y = event.y_root
-        if self._drag_id is None:
-            if self._press["zone"] != "body":
-                return
-            if abs(event.y_root - self._press["y"]) < self.px(5):
-                return                       # 还在阈值内，先不进入拖动，避免影响点击
-            self._begin_drag(self._press["id"])
-        self._drag_to(event.y_root)
+    def _apply_geometry(self, width, height):
+        """我们主动改窗口尺寸：记下目标尺寸，之后收到的同名 Configure 不算用户改大小。"""
+        width, height = int(width), int(height)
+        self._geometry_pending = (width, height)
+        self._geometry_since = time.time()
+        self._applying_geometry = True
+        try:
+            self.win.resize(width, height)
+        finally:
+            self._applying_geometry = False
 
-    def _row_release(self, event):
-        press, self._press = self._press, None
-        if self._drag_id is not None:
-            self._end_drag()
-            return
-        if press is None:
-            return
-        zone = press["zone"]
-        if zone == "steps-edit-check":
-            self._steps_edit_toggle(press.get("step"))
-            return
-        if zone == "steps-edit-area":
-            self._steps_edit_focus(press.get("step"), cursor_to_end=False)
-            return
-        if zone == "step-area":
-            # 点子步骤那一行的文字（不是小方框）：直接进子步骤编辑，光标落在这一行。
-            # 原来这里是空的 —— 用户点步骤文字毫无反应，看起来就像"子步骤编不了"。
-            widget_now = self._row_widget(press["id"])
-            if widget_now is not None:
-                self._begin_steps_edit(press["id"],
-                                       step_index=self._step_index_at(widget_now, event))
-            return
-        if zone == "step":
-            widget = self._row_widget(press["id"])
-            hit = None
-            for index, y0, y1, x0, x1 in getattr(widget, "_step_boxes", None) or []:
-                if x0 <= event.x <= x1 and y0 <= getattr(event, "y", 0) <= y1:
-                    hit = index
-                    break
-            if hit is not None and hit == press.get("step"):
-                self.toggle_step_item(press["id"], hit)
-            return
-        if zone == "body":
-            self.toggle_item(press["id"])
-            return
-        if self._zone_at(event.x) != zone:
-            return                       # 松手时指针得还在同一个按钮上才算数
-        if zone == "delete":
-            self.remove_item(press["id"])
-        elif zone == "steps":
-            self._begin_steps_edit(press["id"])
+    def _restore_geometry(self):
+        if self._anchor_pending is not None:
+            return          # 折叠/展开的锚点还没落位，别抢窗口位置
+        screen_w, screen_h = screen_size()
+        x = self.store.ui.get("x")
+        y = self.store.ui.get("y")
+        if x is None or y is None:
+            x = screen_w - min(self.panel_w, PANEL_W_MAX) - 48
+            y = 96
+        visible_w = min(self.panel_w, PANEL_W_MAX)
+        x = max(0, min(int(x), screen_w - visible_w - 16))
+        if self.store.ui.get("collapsed"):
+            # 折叠态窗口更窄：从展开位置按"离哪边近就保哪边"推出收窄后的 x，
+            # 否则每次启动都会从屏幕右边跳回来。
+            compact_w = self.win.get_size()[0]
+            if compact_w > 100:
+                if x + visible_w / 2.0 > screen_w / 2.0:
+                    x += visible_w - compact_w
+                x = max(0, min(int(x), int(screen_w - compact_w)))
+        y = max(0, min(int(y), screen_h - 120))
+        self.win.move(int(x), int(y))
 
-    def _begin_drag(self, item_id):
-        self._cancel_regroup()               # 拖动期间别归位（归位会重建行，拖到一半会乱）
-        self._drag_id = item_id
-        widget = self._row_widget(item_id)
-        if widget is not None:
-            # 用 Canvas 图元画高亮底 + 左侧强调条：改 Canvas 的 bg 在这里不会重绘
-            height = int(widget.cget("height"))
-            widget.configure(cursor="fleur")
-            widget.create_rectangle(0, 0, self.list_w, height, fill=C_HOVER, outline="",
-                                    tags="dragbg")
-            widget.create_rectangle(0, 0, self.px(3), height, fill=C_ACCENT, outline="",
-                                    tags="dragbg")
-            widget.tag_lower("dragbg")
-        self._drag_target = None
-        try:                             # 落点标记线：盖在当前拖到的位置
-            self._drop_line = tk.Frame(self.inner, bg=C_ACCENT, bd=0,
-                                       highlightthickness=0)
-        except tk.TclError:
-            self._drop_line = None
-        self._start_autoscroll()
-
-    def _end_drag(self):
-        item_id, target = self._drag_id, self._drag_target
-        self._drag_id = None
-        self._drag_target = None
-        self._pointer_y = None
-        self._stop_autoscroll()
-        if self._drop_line is not None:
+    def _on_configure(self, _widget, event):
+        if event.width > 1 and event.height > 1:
+            self._flush_anchor(event.width)      # 折叠/展开的锚点移动等这里
+        if self._applying_geometry or self.store.ui.get("collapsed"):
+            return False
+        if event.width <= 1 or event.height <= 1:
+            return False
+        width, height = int(event.width), int(event.height)
+        pending = self._geometry_pending
+        if pending is not None and abs(pending[0] - width) <= 2 \
+                and abs(pending[1] - height) <= 2:
+            self._geometry_pending = None        # 自己这次 resize 的回声
+            return False
+        if time.time() - self._geometry_since < 0.35:
+            return False                          # WM 动画里的中间尺寸，不当用户改
+        if self._resize_job is not None:
             try:
-                self._drop_line.destroy()
-            except tk.TclError:
+                GLib.source_remove(self._resize_job)
+            except Exception:
                 pass
-            self._drop_line = None
-        widget = self._row_widget(item_id)
-        if widget is not None:
-            widget.configure(cursor="hand2")
-            widget.delete("dragbg")
-        if item_id is not None and target is not None:
-            # 落点是第几"行"，不是第几个数据 —— 有 @标签 筛选时列表比 items 短，
-            # 直接拿行号去 move 会挪错位置；这里换成那条数据在 items 里的下标。
-            self.store.move(item_id, self._store_index_for_row(target), save=False)
-        self.store.save()                    # 新顺序落盘
-        self._refresh()                      # 重画，保持行高/滚动位置一致
-        self._schedule_regroup()             # 万一之前有改过状态还没归位，顺手补上
+        self._resize_job = GLib.timeout_add(
+            180, lambda: (self._apply_user_size(width, height), False)[1])
+        return False
 
-    def _row_widget(self, item_id):
-        for row_id, widget in self.row_widgets:
-            if row_id == item_id:
-                return widget
-        return None
+    def _apply_user_size(self, width, height):
+        """用户拉过窗口：宽度只守下限（内容由 Clamp 限到 520 居中），高度记下来。"""
+        self._resize_job = None
+        width = max(PANEL_W_MIN, int(width))
+        height = max(140, int(height))
+        if (width, height) == (self.panel_w, int(self.store.ui.get("height") or 0)):
+            return
+        self._user_sized = True
+        self.panel_w = width
+        self.store.ui["width"] = width
+        self.store.ui["height"] = height
+        self.store.save()
+        if width != int(self.store.ui.get("width") or width):
+            self._apply_geometry(width, height)
+        self.fit_window()
+
+    # ---- 计数 / 提示 ----
+    def _update_counts(self):
+        visible = self._visible_items()
+        remaining = len([item for item in visible
+                         if self.store.state_of(item) != STATE_DONE])
+        waiting = len([item for item in visible
+                       if self.store.state_of(item) == STATE_WAITING])
+        reminders = self.store.reminder_count(visible)
+        if remaining:
+            text = tr("%d 项未完成", "%d unfinished") % remaining
+            if waiting:
+                text += tr(" · %d 等待", " · %d waiting") % waiting
+            if reminders:
+                text += tr(" · %d 提醒", " · %d reminders") % reminders
+        else:
+            text = tr("全部完成", "All done")
+        self.count.set_text(text)
+        self.compact_count.set_text(text)       # 折叠态单行用的那枚
+        today_done, today_total = self.store.today_stats()
+        return dict(remaining=remaining, waiting=waiting, reminders=reminders,
+                    today_done=today_done, today_total=today_total,
+                    archive=len(self.store.archive))
+
+    def update_hint(self):
+        """底部提示按优先级选一条：提醒 > 撤销 > 子步骤编辑 > 筛选 > 折叠 > 今天 > 常规。"""
+        if self._alert is not None:
+            return                       # 提醒横幅由 show_alert 自己写
+        self.hint.get_style_context().remove_class("warn")
+        if self.undo_btn.get_visible():
+            text = tr("已删除「%s」", "Deleted \"%s\"") % getattr(self, "_undo_text", "")
+        elif self.steps_edit_open:
+            text = tr("回车=保存 · Ctrl+回车=加一步 · Esc=取消",
+                        "Enter=save · Ctrl+Enter=add step · Esc=cancel")
+        elif self.edit_open:
+            text = tr("回车=保存 · Esc=取消", "Enter=save · Esc=cancel")
+        elif self.filter_query:
+            text = tr("搜索「%s」· %d 条", "Search \"%s\" · %d items") \
+                % (self.filter_query, len(self._visible_items()))
+        elif self.filter_tag:
+            text = tr("只看 @%s · 点「全部」看所有", "Only @%s · click All to reset") % self.filter_tag
+        elif self.store.ui.get("collapsed"):
+            text = tr("双击标题栏展开", "Double-click the header to expand")
+        elif getattr(self, "_flash", None):
+            text = self._flash
+        else:
+            today_done, today_total = self.store.today_stats()
+            if today_total:
+                text = tr("今天 %d/%d · 拖动排序 · 双击改名",
+                          "Today %d/%d · drag to sort · double-click to rename") \
+                    % (today_done, today_total)
+            else:
+                text = tr("拖动排序 · 双击改名", "Drag to sort · double-click to rename")
+        self.hint.set_text(text)
+
+    def _update_footer(self):
+        stats = self._update_counts()
+        self.archive_btn.set_label(tr("归档 %d", "Archive %d") % stats["archive"])
+        self._sync_section_counts()
+        self.update_hint()
+
+    def _sync_section_counts(self):
+        """分组标题里的计数跟着单条操作更新；组空了/新组出现才整表重建。"""
+        if self._rendering:
+            return
+        visible = self._visible_items()
+        groups = {}
+        for item in visible:
+            state = self.store.state_of(item)
+            groups[state] = groups.get(state, 0) + 1
+        if set(groups) != set(self.section_widgets):
+            self.render(keep_scroll=True)
+            return
+        for state, count in groups.items():
+            label = self.section_counts.get(state)
+            if label is not None and label.get_text() != str(count):
+                label.set_text(str(count))
+
+    def flash_hint(self, text):
+        self._flash = text
+        if self._hint_job is not None:
+            try:
+                GLib.source_remove(self._hint_job)
+            except Exception:
+                pass
+        self._hint_job = GLib.timeout_add(3000, lambda: (self._restore_hint(), False)[1])
+        self.update_hint()
+
+    def _restore_hint(self):
+        self._hint_job = None
+        self._flash = None
+        self.update_hint()
+
+    # ---- 输入 ----
+    def _on_entry_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.entry.set_text("")
+            return True
+        if (event.state & Gdk.ModifierType.CONTROL_MASK
+                and event.keyval in (Gdk.KEY_f, Gdk.KEY_F)):
+            self.toggle_search(True)
+            return True
+        return False
+
+    def _on_window_key(self, _widget, event):
+        if (event.state & Gdk.ModifierType.CONTROL_MASK
+                and event.keyval in (Gdk.KEY_f, Gdk.KEY_F)):
+            self.toggle_search(True)
+            return True
+        return False
+
+    # ---- 搜索 ----
+    def toggle_search(self, show=None):
+        if show is None:
+            show = not self.search_row.get_visible()
+        if show:
+            self.search_row.show()
+            self.search_entry.grab_focus()
+        else:
+            self.search_entry.set_text("")          # 触发 changed → 恢复列表
+            self.search_row.hide()
+            self.filter_query = None
+            self.render(keep_scroll=False)
+        self.update_hint()
+
+    def _on_search_changed(self, entry):
+        text = entry.get_text().strip()
+        if text == (self.filter_query or ""):
+            return
+        self.filter_query = text or None
+        self.render(keep_scroll=False)
+
+    def _on_search_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.toggle_search(False)
+            return True
+        return False
+
+    def add_from_entry(self):
+        text = self.entry.get_text()
+        item = self.store.add(text)
+        self.entry.set_text("")
+        self._refresh_tags()
+        if item is not None:
+            self.insert_item(item)
+        self.entry.grab_focus()
+
+    def insert_item(self, item):
+        """新增一条：只插这一行（新条目总在未完成组最前），不整表重建。"""
+        state = self.store.state_of(item)
+        visible = self._visible_items()
+        header = self.section_widgets.get(state)
+        if item in visible and header is not None:
+            row = Row(self, item)
+            self.listbox.pack_start(row, False, False, 0)
+            try:
+                first = self.listbox.get_children().index(header) + 1
+            except ValueError:
+                first = None
+            if first is None:
+                self.render(keep_scroll=False)
+                return
+            self.listbox.reorder_child(row, first)
+            row.show_all()
+            self.rows[item["id"]] = row
+            position = visible.index(item)
+            self.row_widgets.insert(position, (item["id"], row))
+        else:
+            self.render(keep_scroll=False)
+            return
+        self._update_counts()
+        self._update_footer()
+        self.fit_window()
+
+    # ---- 单条操作（只重画该行） ----
+    def toggle_item(self, item_id):
+        item = self.store.toggle(item_id)
+        if item is None:
+            return
+        self._last_toggle = (item_id, time.time())
+        self.redraw_row(item_id)
+        self._update_footer()
+        self.schedule_regroup()
+
+    def toggle_waiting_item(self, item_id):
+        item = self.store.toggle_waiting(item_id)
+        if item is None:
+            return
+        self.redraw_row(item_id)
+        self._update_footer()
+        self.schedule_regroup()
+
+    def toggle_today_item(self, item_id):
+        item = self.store.toggle_today(item_id)
+        if item is None:
+            return
+        self.store.place_in_bucket(item_id)
+        self.render()
+
+    def set_priority_item(self, item_id, value):
+        item = self.store.set_priority(item_id, value)
+        if item is None:
+            return
+        self.store.place_in_bucket(item_id)
+        self.render()
+
+    def toggle_step_item(self, item_id, index):
+        item = self.store.toggle_step(item_id, index)
+        if item is None:
+            return
+        self.redraw_row(item_id)
+        self._update_footer()
+
+    def remove_item(self, item_id):
+        record = self.store.pop(item_id)
+        if record is None:
+            return
+        self.dismiss_alert()
+        self.render()
+        self.show_undo(record)
+
+    def undo_delete(self):
+        if self._undo is None:
+            return
+        record = self._undo
+        self._undo = None
+        self._hide_undo()
+        if self.store.restore(record):
+            self.render()
+
+    def show_undo(self, record):
+        text = record["item"]["text"].strip()
+        if len(text) > 14:
+            text = text[:14] + "…"
+        self._undo = record
+        self._undo_text = text
+        self.undo_btn.set_label(tr("撤销删除", "Undo delete"))
+        self.undo_btn.set_no_show_all(False)
+        self.undo_btn.show()
+        self.update_hint()
+        if self._undo_job is not None:
+            try:
+                GLib.source_remove(self._undo_job)
+            except Exception:
+                pass
+        self._undo_job = GLib.timeout_add(
+            int(UNDO_SECONDS * 1000), lambda: (self._hide_undo(), False)[1])
+
+    def _hide_undo(self):
+        self._undo = None
+        if self._undo_job is not None:
+            try:
+                GLib.source_remove(self._undo_job)
+            except Exception:
+                pass
+            self._undo_job = None
+        self.undo_btn.hide()
+
+    def clear_done(self):
+        moved = self.store.clear_done()
+        if moved:
+            self.render()
+            self.flash_hint(tr("已归档 %d 条", "Archived %d") % moved)
+
+    def toggle_done_collapsed(self):
+        self._done_collapsed = not self._done_collapsed
+        self.store.ui["done_collapsed"] = self._done_collapsed
+        self.store.save()
+        self.render(keep_scroll=False)
+
+    # ---- 归位（延迟 1.2s，给双击改名让路） ----
+    def schedule_regroup(self):
+        self._cancel_regroup()
+        if self._edit_id is not None or self._steps_edit_id is not None:
+            return
+        self._regroup_job = GLib.timeout_add(
+            self.REGROUP_DELAY_MS, lambda: (self._regroup_now(), False)[1])
+
+    def _cancel_regroup(self):
+        if self._regroup_job is not None:
+            try:
+                GLib.source_remove(self._regroup_job)
+            except Exception:
+                pass
+            self._regroup_job = None
+
+    def _regroup_now(self):
+        self._regroup_job = None
+        if self._edit_id is not None or self._steps_edit_id is not None:
+            self.schedule_regroup()
+            return
+        if self.drag_id is not None:
+            self.schedule_regroup()
+            return
+        self.store.resort()
+        self.render()
+
+    # ---- 改名 ----
+    @property
+    def edit_open(self):
+        return self._edit_id is not None
+
+    @property
+    def editing_id(self):
+        return self._edit_id
+
+    @property
+    def steps_edit_open(self):
+        return self._steps_edit_id is not None
+
+    @property
+    def steps_edit_id(self):
+        return self._steps_edit_id
+
+    def begin_edit(self, item_id):
+        if self.edit_open and self._edit_id == item_id:
+            return
+        self.end_edit_all(save=True)
+        self._cancel_regroup()
+        row = self.rows.get(item_id)
+        item = self.find_item(item_id)
+        if row is None or item is None:
+            return
+        self._edit_id = item_id
+        row.begin_edit()
+        self.update_hint()
+
+    def end_edit(self, save=True, silend=False):
+        row = self.rows.get(self._edit_id) if self._edit_id is not None else None
+        item_id = self._edit_id
+        self._edit_id = None
+        if row is None:
+            if not silend:
+                self.update_hint()
+            return False
+        text = row.edit_text()
+        row.clear_edit()
+        changed = False
+        if save and item_id is not None:
+            changed = bool(self.store.rename(item_id, text))
+            self.redraw_row(item_id)
+            self._update_footer()
+        if not silend:
+            self.schedule_regroup()
+            self.update_hint()
+        return changed
+
+    def end_steps_edit(self, save=True):
+        row = self.rows.get(self._steps_edit_id) if self._steps_edit_id else None
+        item_id = self._steps_edit_id
+        self._steps_edit_id = None
+        if row is None:
+            self.update_hint()
+            return False
+        changed = False
+        if save and item_id is not None:
+            steps = row.steps_texts()
+            record = self.store.set_steps(item_id, steps)
+            if record is not None:
+                changed = True
+            self.redraw_row(item_id)
+            self._update_footer()
+        row.clear_steps_edit()
+        self.schedule_regroup()
+        self.update_hint()
+        GLib.idle_add(lambda: (self.fit_window(), False)[1])
+        return changed
+
+    def end_edit_all(self, save=True):
+        if self.edit_open:
+            self.end_edit(save=save)
+        if self.steps_edit_open:
+            self.end_steps_edit(save=save)
+
+    def begin_steps_edit(self, item_id, step_index=None):
+        if self.steps_edit_open and self._steps_edit_id == item_id:
+            row = self.rows.get(item_id)
+            if row is not None:
+                row._steps_focus(step_index or self._steps_active)
+            return
+        self.end_edit_all(save=True)
+        row = self.rows.get(item_id)
+        item = self.find_item(item_id)
+        if row is None or item is None:
+            return
+        self._cancel_regroup()
+        self._steps_edit_id = item_id
+        row.begin_steps_edit(focus_index=step_index)
+        self.update_hint()
+
+    # ---- 标签筛选 ----
+    def _refresh_tags(self):
+        tags = self.store.all_tags()
+        if self.filter_tag and self.filter_tag not in tags:
+            self.filter_tag = None
+        existing = getattr(self, "_tag_values", None)
+        if existing == (tags, self.filter_tag):
+            return
+        self._tag_values = (tags, self.filter_tag)
+        for child in self.tags_row.get_children():
+            child.destroy()
+        if not tags:
+            self.tags_row.hide()
+            return
+        self.tags_row.show()
+        buttons = []
+
+        def make_chip(label, value):
+            button = Gtk.Button(label=label)
+            button.get_style_context().add_class("chip")
+            context = button.get_style_context()
+            active = value == self.filter_tag or (value is None
+                                                  and self.filter_tag is None)
+            if active:
+                context.add_class("on")
+            button.connect("clicked", lambda _b, v=value: self.set_filter(v))
+            buttons.append(button)
+            self.tags_row.pack_start(button, False, False, 0)
+
+        make_chip(tr("全部", "All"), None)
+        for tag in tags:
+            make_chip("@" + tag, tag)
+        self.tags_row.show_all()
+
+    def set_filter(self, tag):
+        self.filter_tag = tag
+        self.render(keep_scroll=False)
+
+    # ---- 右键 ----
+    def popup_row_menu(self, row, event):
+        self.end_edit_all(save=True)
+        item = self.find_item(row.item_id)
+        if item is None:
+            return
+        if self._row_menu is not None:
+            try:
+                self._row_menu.destroy()
+            except Exception:
+                pass
+        menu = Gtk.Menu()
+        waiting = self.store.state_of(item) == STATE_WAITING
+        mix = Gtk.MenuItem(label=tr("取消「等待中」", "Clear \"Waiting\"") if waiting
+                          else tr("标记为「等待中」", "Mark as \"Waiting\""))
+        mix.connect("activate", lambda _i: self.toggle_waiting_item(item["id"]))
+        menu.append(mix)
+        today = bool(item.get("today"))
+        mix = Gtk.MenuItem(label=tr("取消「今天要办的」", "Clear \"Today\"") if today
+                          else tr("标记为「今天要办的」", "Mark as \"Today\""))
+        mix.connect("activate", lambda _i: self.toggle_today_item(item["id"]))
+        menu.append(mix)
+
+        priority = self.store.priority_of(item)
+        sub = Gtk.Menu()
+        for value, label in ((PRIORITY_HIGH, tr("高", "High")),
+                             (PRIORITY_MID, tr("中", "Mid")),
+                             (PRIORITY_NONE, tr("无", "None"))):
+            entry = Gtk.RadioMenuItem(label=label)
+            if value == priority:
+                entry.set_active(True)
+            entry.connect("activate",
+                          lambda _i, v=value: self.set_priority_item(item["id"], v))
+            sub.append(entry)
+        priority_item = Gtk.MenuItem(label=tr("优先级（现在：%s）", "Priority (now: %s)") %
+                                     {PRIORITY_HIGH: tr("高", "High"),
+                                      PRIORITY_MID: tr("中", "Mid")}.get(
+                                         priority, tr("无", "None")))
+        priority_item.set_submenu(sub)
+        menu.append(priority_item)
+
+        reminder = item.get("remind_at")
+        label = (tr("改提醒（%s）…", "Change reminder (%s)…")
+                 % format_remind_time(reminder)) if reminder else tr("设提醒…", "Set reminder…")
+        mix = Gtk.MenuItem(label=label)
+        mix.connect("activate", lambda _i: self.ask_reminder(item["id"]))
+        menu.append(mix)
+        if reminder:
+            mix = Gtk.MenuItem(label=tr("取消提醒", "Clear reminder"))
+            mix.connect("activate", lambda _i: self.clear_reminder_item(item["id"]))
+            menu.append(mix)
+
+        steps = self.store.steps_of(item)
+        done_steps, total_steps = self.store.steps_progress(item)
+        label = tr("编辑子步骤…", "Edit sub-steps…")
+        if total_steps:
+            label = tr("编辑子步骤（%d/%d 已完成）…", "Edit sub-steps (%d/%d done)…") \
+                % (done_steps, total_steps)
+        mix = Gtk.MenuItem(label=label)
+        mix.connect("activate", lambda _i: self.begin_steps_edit(item["id"]))
+        menu.append(mix)
+        mix = Gtk.MenuItem(label=tr("＋ 加一条子步骤", "＋ Add a sub-step"))
+        mix.connect("activate", lambda _i: self.add_step_item(item["id"]))
+        menu.append(mix)
+        if steps:
+            mix = Gtk.MenuItem(label=tr("清空子步骤", "Clear sub-steps"))
+            mix.connect("activate", lambda _i: self.clear_steps(item["id"]))
+            menu.append(mix)
+        menu.append(Gtk.SeparatorMenuItem())
+        mix = Gtk.MenuItem(label=tr("删除这条", "Delete this"))
+        mix.connect("activate", lambda _i: self.remove_item(item["id"]))
+        menu.append(mix)
+        menu.show_all()
+        self._row_menu = menu
+        menu.popup_at_pointer(event)
+
+    def add_step_item(self, item_id):
+        steps = self.store.steps_of(self.find_item(item_id))
+        if len(steps) >= STEP_MAX:
+            self.flash_hint(tr("一条最多 %d 个子步骤", "At most %d sub-steps") % STEP_MAX)
+            return
+        self.store.add_step(item_id, "新步骤")
+        self.redraw_row(item_id)
+        self._update_footer()
+
+    def clear_steps(self, item_id):
+        self.store.set_steps(item_id, [])
+        self.redraw_row(item_id)
+        self._update_footer()
+
+    # ---- 窗口菜单动作 ----
+    def popup_window_menu(self, event):
+        self.window_menu.popup_at_pointer(event)
+
+    def toggle_collapsed(self):
+        collapsed = not bool(self.store.ui.get("collapsed"))
+        if collapsed:
+            width, height = self.win.get_size()
+            self._expanded_size = (width, height)
+        self.store.ui["collapsed"] = collapsed
+        self.store.save()
+        self._apply_collapsed()
+
+    def _apply_collapsed(self):
+        collapsed = bool(self.store.ui.get("collapsed"))
+        for widget in (self.input_row, self.tags_row, self.search_row,
+                       self.scrolled, self.footer):
+            if collapsed:
+                widget.hide()
+            elif widget is self.search_row:
+                widget.set_visible(bool(self.filter_query))
+            else:
+                widget.show()
+        if collapsed or not getattr(self, "_session_warn_on", False):
+            self.session_warn.hide()
+        else:
+            self.session_warn.show()
+        self._draw_collapse_icon(collapsed)
+        if collapsed:
+            width, height = self._collapsed_size()
+            # 用 panel_w（展开宽）当锚点基准：启动即折叠时窗口尺寸还不可靠
+            self._resize_anchored(width, height, from_width=self.panel_w)
+        else:
+            width = self.panel_w
+            height = None
+            if self._expanded_size:
+                width, height = self._expanded_size
+            elif self.store.ui.get("width") and self.store.ui.get("height"):
+                width = int(self.store.ui["width"])
+                height = int(self.store.ui["height"])
+            if width != self.panel_w:
+                self.panel_w = max(PANEL_W_MIN, min(PANEL_W_MAX, int(width)))
+            # 先改大、再换回展开态 header：反过来 GTK 会先按"内容最小尺寸"
+            # 把窗口撑到 248×204，然后把我们的 resize 盖掉（实测）。
+            self._resize_anchored(self.panel_w,
+                                  int(height) if height
+                                  else max(140, self.win.get_size()[1]))
+            self._compact_header(False)
+            self.fit_window()
+        self.update_hint()
+
+    def _compact_header(self, compact):
+        """折叠态把两行 header 换成单行：标题 13pt + 计数并排，边距收紧。"""
+        if compact:
+            self.header.get_style_context().add_class("compact")
+            self.header_left.hide()
+            # no_show_all 会让 show_all() 直接跳过，只能逐个 show()
+            self.compact_line.show()
+            self.compact_title.show()
+            self.compact_count.show()
+            self.header.set_spacing(6)
+            self.header.set_margin_start(9)
+            self.header.set_margin_end(4)
+            self.header.set_margin_top(3)
+            self.header.set_margin_bottom(3)
+        else:
+            self.header.get_style_context().remove_class("compact")
+            self.compact_line.hide()
+            self.header_left.show_all()
+            self.header.set_spacing(8)
+            self.header.set_margin_start(16)
+            self.header.set_margin_end(10)
+            self.header.set_margin_top(12)
+            self.header.set_margin_bottom(6)
+
+    def _collapsed_size(self):
+        """折叠态窗口尺寸：单行 header 的自然宽 + 卡片边框 2px。
+
+        宽度随内容，不再跟着展开时的 window width 走；高度按单行 header 算，
+        不再加展开态那 14px 留白（行为契约 §2.8 写的也是 header + 2）。
+        """
+        self._compact_header(True)
+        _min_w, natural_w = self.header.get_preferred_width()
+        min_h, _natural_h = self.header.get_preferred_height()
+        return int(natural_w) + 2, int(min_h) + 2
+
+    def _resize_anchored(self, width, height, from_width=None):
+        """改窗口尺寸时保持"离哪边近，哪边不动"，贴边收窄/展开不会漂走。
+
+        from_width：这次变更前的宽度基准。折叠时要传 panel_w —— 启动即折叠
+        时 win.get_size() 还是窗口没 resize 前的旧值，拿它算锚点会把窗口丢在
+        屏幕中间。
+
+        move 必须等 resize 生效之后再发：KWin 会按"当前宽度"把窗口夹回屏幕内，
+        先 move 再收窄的话（比如想贴右边、旧宽度下越界）会被夹到屏幕中间。
+        """
+        screen_w, _screen_h = screen_size()
+        x, y = self.win.get_position()
+        old_w = self.win.get_size()[0] if from_width is None else from_width
+        if not self.win.get_mapped() or (int(x) == 0 and int(y) == 0):
+            # 还没 map（启动即折叠）：get_position() 是 0,0，拿它算锚点会把
+            # 窗口丢到左上角。改用落盘的展开位置当基准。
+            x = int(self.store.ui.get("x") or 0)
+            y = int(self.store.ui.get("y") or 0)
+            x = max(0, min(x, int(screen_w - old_w - 16)))
+        if old_w > 0 and x + old_w / 2.0 > screen_w / 2.0:
+            x += old_w - width
+        x = max(0, min(int(x), int(screen_w - width)))
+        self._anchor_pending = (int(x), int(y), int(width), int(height))
+        self._apply_geometry(width, height)
+        GLib.timeout_add(160, self._flush_anchor_fallback)
+
+    def _flush_anchor(self, width):
+        """新宽度到位后把窗口挪到锚点位置（宽度一致才动，动画中间帧不算）。"""
+        pending = self._anchor_pending
+        if pending is None or abs(int(width) - pending[2]) > 2:
+            return
+        self._anchor_pending = None
+        self.win.move(pending[0], pending[1])
+
+    def _flush_anchor_fallback(self):
+        pending = self._anchor_pending
+        if pending is not None:                  # 没收到匹配的 Configure 也兜底挪
+            self._anchor_pending = None
+            self.win.move(pending[0], pending[1])
+        return False
+
+    def _draw_collapse_icon(self, collapsed):
+        button = self.collapse_btn
+        child = button.get_child()
+        if child is not None:
+            button.remove(child)
+        button.add(icon_image("pan-end-symbolic" if collapsed else "pan-up-symbolic", 15))
+        button.show_all()
+
+    def toggle_hidden(self):
+        if self.win.get_visible():
+            self.win.hide()
+        else:
+            self.raise_window()
+
+    def _on_sound_toggled(self, item):
+        self.store.ui["sound"] = bool(item.get_active())
+        self.store.save()
+
+    def _on_topmost_toggled(self, item):
+        value = bool(item.get_active())
+        self.store.ui["topmost"] = value
+        self.win.set_keep_above(value)
+        self.store.save()
+
+    def _on_autostart_toggled(self, item):
+        want = bool(item.get_active())
+        if want:
+            autostart_install()
+        else:
+            autostart_uninstall()
+        self._autostart_item.set_active(os.path.exists(autostart_path()))
+        self.flash_hint(tr("开机自启：%s", "Start on login: %s")
+                        % tr("已开启", "on") if want else
+                        tr("开机自启：%s", "Start on login: %s") % tr("已关闭", "off"))
+
+    def set_alpha(self, value, save=True):
+        alpha = max(0.3, min(1.0, float(value)))
+        set_window_opacity(self.win, alpha)
+        if save:
+            self.store.ui["alpha"] = alpha
+            self.store.save()
+
+    def open_alpha_dialog(self):
+        if self._alpha_dialog is not None:
+            self._alpha_dialog.present()
+            return self._alpha_dialog
+        dialog = Gtk.Dialog(title=tr("窗口透明度", "Window opacity"), transient_for=self.win)
+        dialog.get_style_context().add_class("dlg")
+        dialog.add_button(tr("关闭", "Close"), Gtk.ResponseType.CLOSE)
+        dialog.set_resizable(False)
+        box = dialog.get_content_area()
+        box.set_spacing(4)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(8)
+        current = int(round(float(self.store.ui.get("alpha") or 0.94) * 100))
+        label = Gtk.Label(label="%d%%" % current)
+        label.get_style_context().add_class("dlg-label")
+        box.pack_start(label, False, False, 0)
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 30, 100, 1)
+        scale.set_value(current)
+        scale.set_size_request(220, -1)
+        scale.connect("value-changed",
+                      lambda sc: (label.set_text("%d%%" % int(sc.get_value())),
+                                  self.set_alpha(sc.get_value() / 100.0, save=False)))
+        box.pack_start(scale, False, False, 0)
+        tip = Gtk.Label(label=tr("拖动即时预览，关掉即保存", "Live preview, saved on close"))
+        tip.get_style_context().add_class("hint")
+        box.pack_start(tip, False, False, 0)
+        dialog.connect("response", lambda _d, _r: dialog.close())
+        dialog.connect("destroy", lambda _d: self._alpha_dialog_destroyed())
+        dialog.show_all()
+        self._alpha_dialog = dialog
+        return dialog
+
+    def _alpha_dialog_destroyed(self):
+        self.set_alpha(self.win.get_opacity(), save=True)
+        self._alpha_dialog = None
+
+    def open_archive(self):
+        existing = self._archive_window
+        if existing is not None:
+            try:
+                existing.show()
+                return existing
+            except Exception:
+                self._archive_window = None
+        self._archive_window = ArchiveWindow(self)
+        return self._archive_window
+
+    # ---- 双击 / 点别处 ----
+    def is_double_click(self, item_id):
+        last_id, last_at = self._last_click
+        return last_id == item_id and (time.time() - last_at) < 0.35
+
+    def handle_double_click(self, row):
+        """双击条目：撤回第一次单击的勾选，进入改名。"""
+        item_id = row.item_id
+        # 第一次点击把状态翻过一次了：这里翻回去，恢复双击前的样子
+        self.store.toggle(item_id)
+        self.redraw_row(item_id)
+        self._update_footer()
+        self._last_click = (None, 0.0)
+        self._last_toggle = (None, 0.0)
+        self.begin_edit(item_id)
+
+    def _on_window_press(self, _widget, event):
+        """点编辑框/编辑器以外的地方：保存退出（与 v0.2.x 一致）。"""
+        if event.button != 1:
+            return False
+        if not (self.edit_open or self.steps_edit_open):
+            return False
+        target = None
+        try:
+            target = Gtk.get_event_widget(event)
+        except Exception:
+            target = None
+        editing_id = self._edit_id if self._edit_id is not None else self._steps_edit_id
+        row = self.rows.get(editing_id)
+        node = target
+        while node is not None and node is not self.win:
+            if row is not None and node is row:
+                return False             # 点在正在编辑的那一行里，不退出
+            node = node.get_parent()
+        self.end_edit_all(save=True)
+        self._press = None
+        return False
+
+    # ---- 头部拖动 / 菜单 ----
+    def _on_header_press(self, _widget, event):
+        if event.button == 3:
+            self.popup_window_menu(event)
+            return True
+        if event.button != 1:
+            return False
+        now = time.time()
+        last = getattr(self, "_header_last_press", None)
+        self._header_last_press = (now, event.x_root, event.y_root)
+        if last is not None and (now - last[0]) < 0.35 \
+                and abs(event.x_root - last[1]) < 6 \
+                and abs(event.y_root - last[2]) < 6:
+            self._header_drag = None
+            self._header_last_press = None
+            self.toggle_collapsed()
+            return True
+        x, y = self.win.get_position()
+        self._header_drag = {"x": int(event.x_root - x),
+                             "y": int(event.y_root - y), "moved": False}
+        return True
+
+    def _on_header_motion(self, _widget, event):
+        if self._header_drag is None:
+            return False
+        self._header_drag["moved"] = True
+        self.win.move(int(event.x_root - self._header_drag["x"]),
+                      int(event.y_root - self._header_drag["y"]))
+        return True
+
+    def _on_header_release(self, _widget, event):
+        if event.button != 1 or self._header_drag is None:
+            return False
+        if self._header_drag.get("moved"):
+            x, y = self.win.get_position()
+            if self.store.ui.get("collapsed"):
+                # 折叠态存"展开后的位置"，否则下次展开/重启窗口会漂
+                width = self.win.get_size()[0]
+                if x + width / 2.0 > screen_size()[0] / 2.0:
+                    x = x + width - self.panel_w
+            self.store.ui["x"] = int(x)
+            self.store.ui["y"] = int(y)
+            self.store.save()
+        self._header_drag = None
+        return False
+
+    # ---- 拖拽排序 ----
+    def _row_origin_y(self, row):
+        """这一行在屏幕上的顶边 y（用 translate_coordinates，别依赖 GdkWindow.get_origin）。"""
+        try:
+            ok, _x, y = row.translate_coordinates(self.win, 0, 0)
+            if ok:
+                _win_x, win_y = self.win.get_position()
+                return int(win_y + y)
+        except Exception:
+            pass
+        gdk_window = row.get_window()
+        if gdk_window is None:
+            return 0
+        return int(gdk_window.get_origin()[1])
+
+    def row_pressed(self, row, event):
+        item = self.find_item(row.item_id)
+        if item is None:
+            return
+        self._press = {"id": row.item_id, "y": event.y_root,
+                       "time": time.time(), "moved": False, "event": event}
+
+    def row_motion(self, row, event):
+        press = self._press
+        if press is None or press["id"] != row.item_id:
+            return
+        if self.drag_id is None:
+            if abs(event.y_root - press["y"]) < 5:
+                return
+            self.begin_drag(row.item_id)
+        self.drag_to(event.y_root)
+
+    def row_released(self, row, event):
+        press, self._press = self._press, None
+        if self.drag_id is not None:
+            self.end_drag()
+            return True
+        if press is None or press["id"] != row.item_id:
+            return False
+        if abs(event.y_root - press["y"]) < 5:
+            item_id = row.item_id
+            if self._edit_id == item_id or self._steps_edit_id == item_id:
+                return False
+            self.toggle_item(item_id)
+            self._last_click = (item_id, time.time())
+            return True
+        return False
+
+    def begin_drag(self, item_id):
+        self._cancel_regroup()
+        self.drag_id = item_id
+        row = self.rows.get(item_id)
+        if row is not None:
+            row.get_style_context().add_class("selected")
+            row.show_actions(True)
+        line = Gtk.Box()
+        line.get_style_context().add_class("drophint")
+        line.set_margin_top(0)
+        line.set_margin_bottom(0)
+        self.drop_line = line
+        self.listbox.pack_start(line, False, False, 0)
+        line.show()
+
+    def _drag_target_index(self, y_root):
+        if not self.row_widgets:
+            return 0
+        target = None
+        for index, (item_id, row) in enumerate(self.row_widgets):
+            top = self._row_origin_y(row)
+            height = row.get_allocated_height()
+            if top <= y_root < top + height:
+                target = index
+                break
+        if target is None:
+            first_top = self._row_origin_y(self.row_widgets[0][1])
+            target = 0 if y_root < first_top else len(self.row_widgets) - 1
+        return target
+
+    def drag_to(self, y_root):
+        if self.drop_line is None or not self.row_widgets:
+            return
+        target = self._drag_target_index(y_root)
+        target = self._clamp_to_group(self.drag_id, target)
+        self.drag_target = target
+        row = self.rows[self.drag_id]
+        base = self.row_widgets.index((self.drag_id, row))
+        # 行下标 → listbox 子控件位置（中间还有分组标题，不能直接拿行号当位置）
+        target_row = self.row_widgets[target][1]
+        try:
+            node = self.listbox.get_children().index(target_row)
+        except ValueError:
+            return
+        if target > base:
+            node += 1
+        self.listbox.reorder_child(self.drop_line, node)
+
+    def _bucket_of(self, item):
+        return self.store.state_of(item)
+
+    def _clamp_to_group(self, item_id, target):
+        item = self.find_item(item_id)
+        if item is None or not self.row_widgets:
+            return target
+        bucket = self._bucket_of(item)
+        indices = [index for index, (other, _row) in enumerate(self.row_widgets)
+                   if self._bucket_of(self.find_item(other)) == bucket]
+        if not indices:
+            return target
+        return max(indices[0], min(target, indices[-1]))
+
+    def end_drag(self):
+        item_id, target = self.drag_id, self.drag_target
+        self.drag_id = None
+        self.drag_target = None
+        if self.drop_line is not None:
+            try:
+                self.drop_line.destroy()
+            except Exception:
+                pass
+            self.drop_line = None
+        row = self.rows.get(item_id)
+        if row is not None:
+            row.get_style_context().remove_class("selected")
+            row.show_actions(False)
+        if item_id is not None and target is not None:
+            data_index = self._store_index_for_row(target)
+            self.store.move(item_id, data_index, save=False)
+        self.store.save()
+        self.render()
+        self.schedule_regroup()
 
     def _store_index_for_row(self, row_index):
-        """列表第 row_index 行 → 这条数据在 store.items 里的下标（筛选时两者不等长）。"""
         if not self.row_widgets:
             return row_index
         try:
@@ -2565,1664 +4224,434 @@ class TodoWidget(object):
                 return index
         return row_index
 
-    def _drag_to(self, y_root):
-        """记下指针现在落在第几行（只出落点线，松手才真正挪 —— 见 _end_drag）。
-
-        只在自己那一「段」里落点：默认排序是未完成 → 等待中 → 已完成，拖过界也只贴到
-        本段的头/尾，免得一次拖动就把分组打乱（想换段就点勾选框或右键菜单里的「等待中」）。
-        """
-        if not self.row_widgets:
-            return
-        target = None
-        for index, (_, widget) in enumerate(self.row_widgets):
-            top = widget.winfo_rooty()
-            if top <= y_root < top + widget.winfo_height():
-                target = index
-                break
-        if target is None:                   # 拖到列表外：贴到首/尾
-            first_top = self.row_widgets[0][1].winfo_rooty()
-            target = 0 if y_root < first_top else len(self.row_widgets) - 1
-        target = self._clamp_to_group(self._drag_id, target)
-        self._drag_target = target
-        self._show_drop_line(target)     # 先让用户看见"会落到哪"，松手才真挪
-
-    def _show_drop_line(self, target):
-        """把落点标记线摆到第 target 行的上/下沿（往下拖画在下沿，往上拖画在上沿）。"""
-        line, dragged = self._drop_line, self._drag_id
-        if line is None or dragged is None or not self.row_widgets:
-            return
-        try:
-            target = max(0, min(int(target), len(self.row_widgets) - 1))
-            current = self._index_of(dragged)
-            row = self.row_widgets[target][1]
-            y = row.winfo_y()
-            if target > current:
-                y += row.winfo_height()
-            width = max(self.list_w, self.inner.winfo_width() or self.list_w)
-            line.place(x=0, y=max(0, y - self.px(1)), width=width,
-                       height=max(1, self.px(2)))
-            line.lift()
-        except (tk.TclError, ValueError):
-            pass
-
-    def _clamp_to_group(self, item_id, target):
-        """把落点夹在该条目所在的**状态段**内（未完成 / 等待中 / 已完成三段）。
-
-        段内可以自由拖（跨「今天」「优先级」分组都行）—— A 方案，2026-10-26；
-        优先级/今天只在改动的那一刻决定插到哪一组，不再夹取拖拽。
-        """
-        low, high = self._group_span(item_id)
-        return max(low, min(int(target), high))
-
-    def _bucket_of(self, item):
-        """段内分组（状态 → 今天 → 优先级）；只用于"改优先级时插到哪一组"与自检。"""
-        state = self.store.state_of(item)
-        today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
-        return (state, today_rank, -self.store.priority_of(item))
-
-    def _group_span(self, item_id):
-        """被拖条目所在**状态段**在 row_widgets 里的下标范围（含两端）。"""
-        last = max(0, len(self.row_widgets) - 1)
-        item = self._find_item(item_id)
+    # ---- 提醒 ----
+    def ask_reminder(self, item_id):
+        item = self.find_item(item_id)
         if item is None:
-            return 0, last
-        state = self.store.state_of(item)
-        indexes = []
-        for index, (row_id, _) in enumerate(self.row_widgets):
-            row_item = self._find_item(row_id)
-            if row_item is not None and self.store.state_of(row_item) == state:
-                indexes.append(index)
-        if not indexes:
-            return 0, last
-        return min(indexes), max(indexes)
-
-    def _index_of(self, item_id):
-        for index, (row_id, _) in enumerate(self.row_widgets):
-            if row_id == item_id:
-                return index
-        return -1
-
-    def _repack_rows(self):
-        """按 store.items 的新顺序重新摆放行（只动顺序，不重建内容）。"""
-        by_id = dict(self.row_widgets)
-        ordered = [(item["id"], by_id[item["id"]])
-                   for item in self.store.items if item["id"] in by_id]
-        if len(ordered) != len(self.row_widgets):
             return
-        for _, widget in ordered:
-            widget.pack_forget()
-        for _, widget in ordered:
-            widget.pack(fill="x")
-        self.row_widgets = ordered
-
-    def _start_autoscroll(self):
-        if self._autoscroll_job is None:
-            self._autoscroll_job = self.root.after(70, self._autoscroll_tick)
-
-    def _stop_autoscroll(self):
-        if self._autoscroll_job is not None:
+        if self._reminder_dialog is not None:
             try:
-                self.root.after_cancel(self._autoscroll_job)
-            except (tk.TclError, ValueError):
+                self._reminder_dialog.destroy()
+            except Exception:
                 pass
-            self._autoscroll_job = None
-
-    def _autoscroll_tick(self):
-        """拖到列表上下边缘时持续滚动，方便把条目挪到看不见的位置。"""
-        self._autoscroll_job = None
-        if self._drag_id is None or self._pointer_y is None:
-            return
-        if self.inner.winfo_reqheight() > self.list_max_h:
-            top = self.canvas.winfo_rooty()
-            bottom = top + self.canvas.winfo_height()
-            if self._pointer_y < top + self.px(14):
-                self.canvas.yview_scroll(-1, "units")
-                self._drag_to(self._pointer_y)
-            elif self._pointer_y > bottom - self.px(14):
-                self.canvas.yview_scroll(1, "units")
-                self._drag_to(self._pointer_y)
-        self._start_autoscroll()
-
-    def _update_counts(self):
-        self._refresh_tags()
-        visible = self._visible_items()
-        remaining = self.store.remaining(visible)
-        waiting = self.store.waiting_count(visible)
-        reminders = self.store.reminder_count(visible)
-        if visible and remaining == 0:
-            text = "全部完成"
-        elif waiting:
-            text = "%d 项未完成 · %d 等待" % (remaining, waiting)
+            self._reminder_dialog = None
+        dialog = Gtk.Dialog(title=tr("设提醒", "Set reminder"), transient_for=self.win)
+        dialog.add_button(tr("取消", "Cancel"), Gtk.ResponseType.CANCEL)
+        ok = dialog.add_button(tr("设好", "Set"), Gtk.ResponseType.OK)
+        ok.set_receives_default(True)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(6)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(8)
+        label = Gtk.Label(label=tr("什么时候提醒（HH:MM）", "When to remind (HH:MM)"))
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+        entry = Gtk.Entry()
+        current = item.get("remind_at")
+        if current:
+            entry.set_text(format_remind_time(current))
+            entry.select_region(0, -1)
         else:
-            text = "%d 项未完成" % remaining
-        if reminders:
-            text += " · %d 提醒" % reminders
-        self.count.configure(text=text)
+            entry.set_placeholder_text(tr("比如 15:30（过了这个点就落到明天）",
+                                                "e.g. 15:30 (past today → tomorrow)"))
+        box.pack_start(entry, False, False, 0)
+        error = Gtk.Label(label="")
+        error.get_style_context().add_class("dlg-error")
+        error.set_xalign(0)
+        box.pack_start(error, False, False, 0)
+        dialog.show_all()
+        self._reminder_dialog = dialog
 
-    def _update_footer(self):
-        self._update_hint()
-        if self.store.has_done():
-            self.clear_btn.pack(side="right")
-        else:
-            self.clear_btn.pack_forget()
+        def submit(_dialog=None, _response=None):
+            when = parse_remind_time(entry.get_text())
+            if when is None:
+                error.set_text(tr("写成 15:30 这样", "Use a time like 15:30"))
+                return
+            self.store.set_reminder(item_id, when)
+            self.redraw_row(item_id)
+            self._update_footer()
+            dialog.destroy()
+            self._reminder_dialog = None
+            self.flash_hint(tr("已设提醒：%s", "Reminder set: %s")
+                        % format_remind_time(when))
 
-    def _archive_on_start(self):
-        """启动时看一眼：有没有「今天 00:00 之前完成」的，有就收进归档。
-
-        刻意**不做**周期性检查 —— 免得东西在你眼前 00:00 那一下消失；
-        只在打开它的时候收（一天最多一次，`_archived_day` 记着今天已经看过了）。
-        """
-        self._archive_tick()
-
-    def _archive_tick(self, now=None):
-        """跨天就把「今天 00:00 之前完成」的条目收进归档；返回收了几条（同一天再叫返回 0）。"""
-        now = time.time() if now is None else now
-        day = self.store.day_start(now)
-        if self._archived_day == day:
-            return 0
-        moved = self.store.archive_completed(now)
-        self._archived_day = day
-        if moved:
-            self._refresh(keep_scroll=False)
-        return moved
-
-    def _update_hint(self):
-        """底部提示：折叠时提示展开，条目够多时提示可拖动排序 / 双击可改。"""
-        if self._alert is not None:
-            return                     # 到点提醒优先，别被常规提示盖掉
-        if self._undo is not None:
-            return                     # 正在显示「已删除…＋撤销」，别把它覆盖掉
-        if self._steps_edit is not None:
-            self.hint.configure(text="回车=保存 · Ctrl+回车=加一步 · Esc=取消",
-                                fg=C_ACCENT)
-            return
-        if self.filter_tag:
-            self.hint.configure(text="只看 @%s（%d 条）· 点上面的「全部」取消"
-                                     % (self.filter_tag, len(self._visible_items())),
-                                fg=C_ACCENT)
-            return
-        if self.store.ui["collapsed"]:
-            text = "双击标题展开"
-        elif self.store.today_stats()[1]:
-            done, total = self.store.today_stats()
-            self.hint.configure(text="今天 %d/%d" % (done, total), fg=C_ACCENT)
-            return
-        elif len(self.store.items) >= 2:
-            text = "拖动可排序，双击可改"
-        else:
-            text = "双击标题可折叠"
-        self.hint.configure(text=text, fg=C_MUTED)
-
-    def _show_undo(self, record):
-        """底部临时显示「已删除「…」 + 撤销」，过一会儿自动收起。"""
-        if self._alert is not None:        # 提醒横幅让位给撤销（撤销只有 8 秒）
-            self._dismiss_alert()
-        text = record["item"]["text"]
-        limit = 14
-        if len(text) > limit:
-            text = text[:limit] + "…"
-        self.hint.configure(text="已删除「%s」" % text, fg=C_TEXT)
-        self.undo_btn.pack(side="left", padx=(self.px(6), 0))
-        if self._undo_job is not None:
-            try:
-                self.root.after_cancel(self._undo_job)
-            except (tk.TclError, ValueError):
-                pass
-        self._undo_job = self.root.after(int(UNDO_SECONDS * 1000), self._clear_undo)
-
-    def _clear_undo(self):
-        """撤销时限到了：收起按钮、恢复普通提示。"""
-        self._undo_job = None
-        self._undo = None
-        self.undo_btn.pack_forget()
-        self._update_hint()
-
-    # ---- 到点提醒 ----
-    def _remind_tick(self, raise_it=True):
-        """检查有没有到点的提醒；到点就弹横幅、把窗口提到前面，然后挂下一次检查。
-
-        `raise_it=False` 用在两处：启动时（窗口本来就在前面）和自检里（不打扰桌面）。
-        """
-        if self._remind_job is not None:
-            try:
-                self.root.after_cancel(self._remind_job)
-            except (tk.TclError, ValueError):
-                pass
-            self._remind_job = None
-        due = self.store.due_reminders()
-        if due:
-            for item in due:
-                item["remind_at"] = None        # 只响一次；改时间再设
-            self.store.save()
-            for item in due:                    # 行尾的 ⏰ 时间跟着消失
-                if not self._redraw_row(item["id"]):
-                    self._refresh()
-                    break
-            self._show_alert(due)
-            self._update_counts()
-            if raise_it:
-                try:
-                    self.raise_window()
-                except tk.TclError:
-                    pass
-            try:
-                self.root.bell()                # 一声铃；系统静音/无声卡就算了
-            except tk.TclError:
-                pass
-        try:
-            self._remind_job = self.root.after(REMIND_POLL_MS, self._remind_tick)
-        except tk.TclError:
-            self._remind_job = None
-
-    def _show_alert(self, items):
-        """底部横幅：⏰ 到点什么 + 「知道了」。多条时只列前三条。"""
-        self._alert = list(items)
-        names = "；".join(item["text"][:16] for item in items[:3])
-        if len(items) > 3:
-            names += " 等 %d 条" % len(items)
-        self.hint.configure(text="⏰ %s" % names, fg=C_WAIT)
-        self.undo_btn.pack_forget()
-        self.alert_btn.pack(side="left", padx=(self.px(6), 0))
-
-    def _dismiss_alert(self):
-        self._alert = None
-        self.alert_btn.pack_forget()
-        self._update_hint()
-
-    def _flash_hint(self, text):
-        """临时提示 3 秒（设/取消提醒后的反馈），然后回到常规提示。"""
-        if self._alert is not None:
-            return
-        self.hint.configure(text=text, fg=C_ACCENT)
-        if self._hint_job is not None:
-            try:
-                self.root.after_cancel(self._hint_job)
-            except (tk.TclError, ValueError):
-                pass
-        self._hint_job = self.root.after(3000, self._restore_hint)
-
-    def _restore_hint(self):
-        self._hint_job = None
-        if self._alert is None:
-            self._update_hint()
-
-    def set_reminder_item(self, item_id, when):
-        item = self.store.set_reminder(item_id, when)
-        if item is None:
-            return None
-        self._redraw_row(item_id)          # 行尾的 ⏰ 时间要立刻出现
-        self._update_counts()
-        self._flash_hint("已设提醒：%s" % format_remind_time(when))
-        return item
+        entry.connect("activate", lambda _e: submit())
+        dialog.connect("response", lambda d, response: submit() if response == Gtk.ResponseType.OK else d.destroy())
+        entry.grab_focus()
 
     def clear_reminder_item(self, item_id):
-        item = self.store.clear_reminder(item_id)
-        if item is None:
-            return None
-        self._redraw_row(item_id)          # 行尾的 ⏰ 时间要立刻消失
-        self._update_counts()
-        self._flash_hint("已取消提醒")
-        return item
-
-    def _ask_reminder(self, item_id):
-        """右键 → 设提醒：一个小对话框，只认 HH:MM（过了今天就落到明天）。"""
-        item = self._find_item(item_id)
-        if item is None:
-            return None
-        current = item.get("remind_at")
-        default = time.strftime("%H:%M", time.localtime(
-            current if current else time.time() + 3600))
-
-        win = tk.Toplevel(self.root)
-        win.title("设提醒")
-        win.configure(bg=C_CARD)
-        win.transient(self.root)
-        win.resizable(False, False)
-        tk.Label(win, text="几点提醒？（HH:MM，过了点就明天）", bg=C_CARD, fg=C_DIM,
-                 font=self.fonts["small"]).pack(padx=self.px(14), pady=(self.px(12), self.px(6)))
-        entry = tk.Entry(win, font=self.fonts["base"], width=8, bg=C_LIST, fg=C_TEXT,
-                         insertbackground=C_TEXT, relief="flat", justify="center")
-        entry.insert(0, default)
-        entry.pack(padx=self.px(14), ipady=self.px(4))
-        error = tk.Label(win, text="", bg=C_CARD, fg=C_DANGER, font=self.fonts["small"])
-        error.pack(padx=self.px(14))
-        buttons = tk.Frame(win, bg=C_CARD)
-        buttons.pack(padx=self.px(14), pady=self.px(10))
-
-        def close():
-            try:
-                win.grab_release()
-            except tk.TclError:
-                pass
-            win.destroy()
-
-        def submit(event=None):
-            when = parse_remind_time(entry.get())
-            if when is None:
-                error.configure(text="写成 15:30 这样")
-                return
-            close()
-            self.set_reminder_item(item_id, when)
-
-        ok = tk.Label(buttons, text="确定", bg=C_CARD, fg=C_ACCENT,
-                      font=self.fonts["small"], cursor="hand2", padx=self.px(8))
-        ok.pack(side="left")
-        cancel = tk.Label(buttons, text="取消", bg=C_CARD, fg=C_MUTED,
-                          font=self.fonts["small"], cursor="hand2", padx=self.px(8))
-        cancel.pack(side="left")
-        ok.bind("<Button-1>", submit)
-        cancel.bind("<Button-1>", lambda event: close())
-        win.bind("<Return>", submit)
-        win.bind("<Escape>", lambda event: close())
-        win.protocol("WM_DELETE_WINDOW", close)
-        win.update_idletasks()
-        win.geometry("+%d+%d" % (self.root.winfo_rootx() + self.px(40),
-                                 self.root.winfo_rooty() + self.px(70)))
-        entry.focus_set()
-        entry.select_range(0, "end")
-        try:
-            win.grab_set()                 # 窗口还没 viewable 时抓不到；抓不到不影响输入
-        except tk.TclError:
-            pass
-        return win
-
-    def _on_inner_configure(self, event=None):
-        height = min(self.inner.winfo_reqheight(), self.list_max_h)
-        if int(self.canvas.cget("height")) != height:
-            self.canvas.configure(height=height)
-        self.canvas.configure(scrollregion=(0, 0, self.inner.winfo_reqwidth(),
-                                            self.inner.winfo_reqheight()))
-
-    def _on_canvas_configure(self, event):
-        self.canvas.itemconfigure(self.canvas.find_all()[0], width=event.width)
-
-    # ---- 尺寸 / 位置 ----
-    def _resize(self, force=False):
-        """按内容定窗口尺寸；force=True 时连「用户拉过大小」也不照顾（折叠/展开要用）。"""
-        self.card.update_idletasks()
-        if self.store.ui["collapsed"]:
-            height = self.header.winfo_reqheight() + self.px(2)
-        else:
-            height = self.card.winfo_reqheight() + self.px(2)
-        width = self.panel_w
-        if self._user_sized and not force:
-            # 用户自己拉过大小：只增不减，别把他的窗口缩回去
-            try:
-                width = max(width, self.root.winfo_width())
-                height = max(height, self.root.winfo_height())
-            except tk.TclError:
-                pass
-        self.root.geometry("%dx%d" % (width, height))
-
-    def _restore_position(self):
-        self.root.update_idletasks()
-        self._apply_saved_size()
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        x = self.store.ui["x"]
-        y = self.store.ui["y"]
-        if x is None or y is None:
-            x = screen_w - self.panel_w - self.px(48)
-            y = self.px(96)
-        x = max(self.px(80) - self.panel_w, min(int(x), screen_w - self.px(80)))
-        y = max(0, min(int(y), screen_h - self.px(40)))
-        self.root.geometry("+%d+%d" % (x, y))
-
-    def _apply_collapsed(self):
-        collapsed = self.store.ui["collapsed"]
-        if collapsed:
-            self.input_row.pack_forget()
-            self.list_area.pack_forget()
-            self.footer.pack_forget()
-        else:
-            self.input_row.pack(fill="x", padx=self.pad, pady=(self.px(2), self.px(8)))
-            self.list_area.pack(fill="x", padx=self.pad, pady=(0, self.px(8)))
-            self.footer.pack(fill="x", padx=self.pad,
-                             pady=(0, max(0, self.pad - self.px(4))))
-        self._update_hint()
-        self._draw_icon(self.collapse_btn, "collapse", C_DIM)
-        # 折叠要真的把窗口收成一条；展开要回到折叠前的高度（用户拉过大小也算）
-        self._resize(force=True)
-        if not collapsed:
-            size = self._expanded_size
-            if size is None and self._user_sized \
-                    and self.store.ui.get("height"):
-                size = (self.root.winfo_width(), int(self.store.ui["height"]))
-            if self._user_sized and size and int(size[1] or 0) > 1:
-                try:
-                    self.root.update_idletasks()
-                    self.root.geometry("%dx%d" % (self.root.winfo_width(), int(size[1])))
-                except (tk.TclError, TypeError, ValueError):
-                    pass
-            self._expanded_size = None
-    # ---- 拖动 ----
-    def _drag_start(self, event):
-        self._drag_offset = (event.x_root - self.root.winfo_x(),
-                             event.y_root - self.root.winfo_y())
-
-    def _drag_move(self, event):
-        if self._drag_offset is None:
-            return
-        offset_x, offset_y = self._drag_offset
-        self.root.geometry("+%d+%d" % (event.x_root - offset_x, event.y_root - offset_y))
-
-    def _drag_end(self, event):
-        if self._drag_offset is None:
-            return
-        self._drag_offset = None
-        self.store.ui["x"] = self.root.winfo_x()
-        self.store.ui["y"] = self.root.winfo_y()
-        if self._user_sized:
-            self.store.ui["width"] = self.root.winfo_width()
-            if not self.store.ui["collapsed"]:
-                self.store.ui["height"] = self.root.winfo_height()
-        self.store.save()
-
-    def _popup_menu(self, event):
-        try:
-            self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
-
-    # ---- 动作 ----
-    def add_from_entry(self):
-        self._clear_placeholder()          # 只清占位文字，用户输入原样保留
-        created = self.store.add(self.entry.get())
-        self.entry.delete(0, "end")
-        if created is not None:
-            self._refresh(keep_scroll=False)
-        self.entry.focus_force()      # 输入完留在输入框里，提示文字等失焦后再显示
-        return created
-
-    def toggle_item(self, item_id):
-        """勾选 / 取消：只重画这一行，不整表重建（否则双击永远到不了编辑）。"""
-        item = self.store.toggle(item_id)
-        if item is None:
-            return None
-        self._last_toggle = (item_id, time.time())
-        if not self._redraw_row(item_id):
-            self._refresh()
-        self._schedule_regroup()
-        self._update_counts()
+        self.store.clear_reminder(item_id)
+        self.redraw_row(item_id)
         self._update_footer()
-        return item
+        self.flash_hint(tr("已取消提醒", "Reminder cleared"))
 
-    def toggle_waiting_item(self, item_id):
-        """标记 / 取消「等待中」：同样只重画那一行。
-
-        等待中不是完成：事情已经着手，但在等别人反馈，所以从「未完成」里分出来单列，
-        计数里也单独显示，免得天天看到它以为自己在拖。
-        """
-        item = self.store.toggle_waiting(item_id)
-        if item is None:
-            return None
-        if not self._redraw_row(item_id):
-            self._refresh()
-        self._schedule_regroup()
-        self._update_counts()
+    def set_reminder_item(self, item_id, when):
+        self.store.set_reminder(item_id, when)
+        self.redraw_row(item_id)
         self._update_footer()
-        return item
+        self.flash_hint(tr("已设提醒：%s", "Reminder set: %s")
+                        % format_remind_time(when))
 
-    def add_step_item(self, item_id):
-        """右键菜单：加一条子步骤，然后重画那一行。"""
-        item = self.store.add_step(item_id)
-        if item is None:
-            return None
-        if not self._redraw_row(item_id):
-            self._refresh()
-        return item
-
-    def set_priority_item(self, item_id, value):
-        """右键菜单里选了优先级：改完插到新分组最前面（段内其余顺序不动）。"""
-        item = self.store.set_priority(item_id, value)
-        if item is None:
-            return None
-        if self.store.place_in_bucket(item_id):
-            self._refresh()                  # 位置变了：行顺序要重排
-        elif not self._redraw_row(item_id):
-            self._refresh()
-        return item
-
-    def toggle_step_item(self, item_id, index):
-        """勾选一个子步骤：只重画那一行；不动主条目的状态，也不参与排序。
-
-        子步骤编辑器开着的时候走编辑器自己的路径：只改编辑中的勾选状态，
-        保存时一起落盘（不重建行控件，输入框也不会被销毁）。
-        """
-        editor = self._steps_edit
-        if editor is not None and editor[1] == item_id:
-            self._steps_edit_toggle(index)
-            return self._find_item(item_id)
-        item = self.store.toggle_step(item_id, index)
-        if item is None:
-            return None
-        if not self._redraw_row(item_id):
-            self._refresh()
-        self._update_footer()
-        return item
-
-    def cycle_priority_item(self, item_id):
-        """点旗子：无 → 高 → 中 → 无。改完插到新分组最前面。"""
-        item = self.store.cycle_priority(item_id)
-        if item is None:
-            return None
-        if self.store.place_in_bucket(item_id):
-            self._refresh()
-        elif not self._redraw_row(item_id):
-            self._refresh()
-        return item
-
-    def toggle_today_item(self, item_id):
-        """标记 / 取消「今天要办的」：改完插到「今天」组最前面。"""
-        item = self.store.toggle_today(item_id)
-        if item is None:
-            return None
-        if self.store.place_in_bucket(item_id):
-            self._refresh()
-        elif not self._redraw_row(item_id):
-            self._refresh()
-        self._update_footer()             # 底部「今天 x/y」要跟着变
-        return item
-
-    # ---- 归位（默认排序：未完成 → 等待中 → 已完成）----
-    def _schedule_regroup(self):
-        """状态变了先别急着把它挪到别的段去，等用户停手再归位。
-
-        原因和「双击改名」直接相关：双击的第一下按单击处理会改状态，如果这一下就让整行
-        飞到列表底部，第二下就落到别的行上了 —— Tk 判定双击要求两次点击在同一个控件上，
-        编辑框再也打不开。所以归位推迟到 REGROUP_DELAY_MS 之后，且在拖动/编辑/按住时顺延。
-        """
-        self._cancel_regroup()
+    def _remind_tick(self, raise_it=True):
+        self._remind_job = None
         try:
-            self._regroup_job = self.root.after(self.REGROUP_DELAY_MS, self._regroup_now)
-        except tk.TclError:
-            self._regroup_job = None
-
-    def _cancel_regroup(self):
-        if self._regroup_job is not None:
-            job, self._regroup_job = self._regroup_job, None
-            try:
-                self.root.after_cancel(job)
-            except (tk.TclError, ValueError):
-                pass
-
-    def _regroup_now(self):
-        """把列表按状态归位；用户正在操作时顺延，别抢他的鼠标。"""
-        self._regroup_job = None
-        if self._drag_id is not None or self._press is not None \
-                or self._edit_entry is not None:
-            self._schedule_regroup()
-            return
-        if self.store.resort(save=True):
-            self._refresh()
-
-    def remove_item(self, item_id):
-        """删除一条：先记下它和原位置，底部留 8 秒撤销窗口。"""
-        if self._edit_entry is not None:
-            self._end_edit(save=True)      # 正在编辑就先收好，别改到已经删掉的行
-        record = self.store.pop(item_id)
-        if record is None:
-            return
-        self._undo = record
-        self._refresh()
-        self._show_undo(record)
-
-    def undo_delete(self):
-        """把刚删掉的那条放回它原来的位置。"""
-        record, self._undo = self._undo, None
-        if self._undo_job is not None:
-            try:
-                self.root.after_cancel(self._undo_job)
-            except (tk.TclError, ValueError):
-                pass
-            self._undo_job = None
-        self.undo_btn.pack_forget()
-        if record is not None and self.store.restore(record):
-            self._refresh()
-        else:
-            self._update_hint()
-        return record
-
-    # ---- 双击编辑 ----
-    def _find_item(self, item_id):
-        for item in self.store.items:
-            if item["id"] == item_id:
-                return item
-        return None
-
-    def _begin_edit(self, item_id, event=None):
-        """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
-        # 双击的第二次按下既会命中 <Double-Button-1>（打开编辑器），也会命中
-        # bind_all 的 <Button-1>（"点别处退出编辑"）—— 记下这一下的 serial，
-        # 让同一次事件里的全局处理放行，否则编辑器刚开就被自己关掉。
-        serial = getattr(event, "serial", None)
-        self._edit_open_serial = serial if serial else None
-        if event is not None and event.x >= self._marker_zone_start():
-            return                         # 双击落在右侧按钮上，不当编辑
-        editor = self._steps_edit
-        if editor is not None and editor[1] == item_id:
-            # 已经在编子步骤了：双击只是换个输入框，别保存→重开
-            self._steps_edit_focus(self._steps_edit_nearest(getattr(event, "y", 0)))
-            return
-        if event is not None:
-            widget_now = self._row_widget(item_id)
-            if widget_now is not None and getattr(event, "y", 0) >= \
-                    getattr(widget_now, "_step_top", 1e9):
-                # 双击在子步骤那一行上：进"子步骤编辑"，光标落在双击的那一行，
-                # 而不是什么都不做、也不是去改主文字（这两点都踩过）
-                self._begin_steps_edit(item_id,
-                                       step_index=self._step_index_at(widget_now, event))
-                return
-        self._cancel_regroup()             # 编辑期间不归位：_refresh() 会把输入框一起销毁
-        self._end_steps_edit(save=True)    # 子步骤编辑器也先收掉
-        if self._edit_entry is not None:
-            self._end_edit(save=True)      # 先收掉上一个
-        # 双击的第一下已经按「单击 = 勾选」处理过了；双击的语义是改文字，
-        # 不该顺手改完成状态，所以这里把那次勾选撤回来。
-        last_id, last_at = self._last_toggle
-        if (event is not None and last_id == item_id
-                and (time.time() - last_at) < DOUBLE_CLICK_REVERT_S):
-            self._last_toggle = (None, 0.0)
-            self.store.toggle(item_id)
-            self._redraw_row(item_id)
-            self._update_counts()
-            self._update_footer()
-        widget = self._row_widget(item_id)
-        item = self._find_item(item_id)
-        if widget is None or item is None:
-            return
-        entry = tk.Entry(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
-                         relief="flat", bd=0, font=self.fonts["base"],
-                         highlightthickness=0)
-        tags = self.store.tags_of(item)
-        entry.insert(0, item["text"] + (" " + " ".join("@" + t for t in tags) if tags else ""))
-        entry.select_range(0, "end")
-        # 只盖标题文字那一块：有子步骤时子步骤继续露着（和子步骤编辑器同一个原则）
-        main_h = int(getattr(widget, "_main_h", 0)) or \
-            self.fonts["base"].metrics("linespace")
-        entry.place(x=self.text_x - self.px(2), y=self.row_pad_y,
-                    width=max(self.px(40),
-                              self.list_w - self.text_x - self.del_w - self.px(2)),
-                    height=max(self.px(16), main_h))
-        entry.bind("<Return>", lambda event: self._end_edit(save=True))
-        entry.bind("<KP_Enter>", lambda event: self._end_edit(save=True))   # 小键盘回车
-        entry.bind("<Escape>", lambda event: self._end_edit(save=False))
-        entry.bind("<FocusOut>", self._edit_focus_out)
-        self._edit_id = item_id
-        self._edit_entry = entry
-        try:
-            entry.focus_force()
-        except tk.TclError:
-            pass
-
-    def _end_edit(self, save=True, incremental=False):
-        """结束编辑：先把状态摘掉再销毁控件，免得回调打在被销毁的控件上。
-
-        incremental=True 只重画这一行、不整表重建：点到别的条目时要用它 ——
-        整表重建会把别的行控件也换掉，用户紧接着的双击就接不上了。
-        """
-        entry, item_id = self._edit_entry, self._edit_id
-        if entry is None:
-            return False
-        self._edit_entry = None
-        self._edit_id = None
-        try:
-            text = entry.get()
-        except tk.TclError:
-            return False
-        try:
-            entry.destroy()
-        except tk.TclError:
-            pass
-        changed = self.store.rename(item_id, text) if save else False
-        if incremental and self._redraw_row(item_id):
-            self._update_counts()
-            self._update_footer()
-        else:
-            self._refresh()
-        self._schedule_regroup()             # 编辑结束再归位（编辑中归位会把输入框销毁）
-        return changed
-
-    def _build_row_menu(self, item_id):
-        """右键条目的菜单。右侧图标区删掉的动作都搬到这里（拆出来是为了自检能查它）。"""
-        item = self._find_item(item_id)
-        if item is None:
-            return None
-        menu = tk.Menu(self.root, tearoff=0)
-        waiting = self.store.state_of(item) == STATE_WAITING
-        menu.add_command(label="取消「等待中」" if waiting else "标记为「等待中」",
-                         command=lambda: self.toggle_waiting_item(item_id))
-        marked = bool(item.get("today"))
-        menu.add_command(label="取消「今天要办的」" if marked else "标记为「今天要办的」",
-                         command=lambda: self.toggle_today_item(item_id))
-        priority = self.store.priority_of(item)
-        prio_names = {PRIORITY_NONE: "无", PRIORITY_MID: "中", PRIORITY_HIGH: "高"}
-        prio_menu = tk.Menu(menu, tearoff=0)
-        prio_var = tk.IntVar(master=self.root, value=priority)
-        menu._prio_var = prio_var                 # 别让 IntVar 被回收
-        for label, value in (("高", PRIORITY_HIGH), ("中", PRIORITY_MID),
-                             ("无", PRIORITY_NONE)):
-            prio_menu.add_radiobutton(label=label, value=value, variable=prio_var,
-                                      command=lambda v=value: self.set_priority_item(item_id, v))
-        menu.add_cascade(label="优先级（现在是%s）" % prio_names.get(priority, "无"),
-                         menu=prio_menu)
-        when = item.get("remind_at")
-        menu.add_separator()
-        if when:
-            menu.add_command(label="改提醒（%s）…" % format_remind_time(when),
-                             command=lambda: self._ask_reminder(item_id))
-            menu.add_command(label="取消提醒",
-                             command=lambda: self.clear_reminder_item(item_id))
-        else:
-            menu.add_command(label="设提醒…", command=lambda: self._ask_reminder(item_id))
-        done, total = self.store.steps_progress(item)
-        menu.add_separator()
-        menu.add_command(label=("编辑子步骤…" if not total
-                                else "编辑子步骤（%d/%d 已完成）…" % (done, total)),
-                         command=lambda: self._begin_steps_edit(item_id))
-        menu.add_command(label="＋ 加一条子步骤",
-                         command=lambda: self.add_step_item(item_id))
-        if total:
-            menu.add_command(label="清空子步骤",
-                             command=lambda: self._clear_steps(item_id))
-        menu.add_separator()
-        menu.add_command(label="删除这条", command=lambda: self.remove_item(item_id))
-        return menu
-
-    def _popup_row_menu(self, event, item_id):
-        menu = self._build_row_menu(item_id)
-        if menu is None:
-            return
-        self._dismiss_row_menu()               # 先收起上一个，别堆着
-        self._row_menu = menu
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
-    def _dismiss_row_menu(self, *args, **kwargs):
-        """收起右键菜单：点别处、再右键、或菜单被选过之后都走这里。
-
-        签名为什么收 *args：Tk 走 bind_all 时实测会**传两个参数**进来
-        （TypeError: <lambda>() takes 1 positional argument but 2 were given）——
-        收窄成 event 一个参数的话，回调会抛异常、菜单就收不掉了。
-        Tk 自带的"点外部自动收起"在这套无边框窗口上也不可靠（实测点空白处菜单不走），
-        所以额外挂全局绑定兜底，并且**销毁**菜单控件，免得每次右键都堆一个。
-        """
-        menu = self._row_menu
-        if menu is None:
-            return
-        event = args[0] if args else None
-        hit = getattr(event, "widget", None)
-        if hit is not None and str(hit).startswith(str(menu)):
-            return                         # 点在菜单自己身上：交给菜单处理，别销毁
-        self._row_menu = None
-        try:
-            menu.unpost()
-        except tk.TclError:
-            pass
-        try:
-            menu.destroy()
-        except tk.TclError:
-            pass
-
-    def _on_global_click(self, *args, **kwargs):
-        """点编辑框以外的地方：结束正在进行的编辑（按保存处理）。
-
-        三种编辑状态都管：改标题的单行框、子步骤的一组输入框、以及它们之间的切换。
-        子步骤编辑里那几块输入框、以及这一行的子步骤区（小方框 / 框间空隙）不算"外面"，
-        点了要保持编辑状态 —— 否则点小方框勾选会被误当成"点到别处"。
-        """
-        event = args[0] if args else None
-        if event is None:
-            return
-        serial = getattr(event, "serial", None)
-        if serial and self._edit_open_serial and serial == self._edit_open_serial:
-            return                           # 就是"打开编辑器"的那一次按下，别自己关自己
-        hit = getattr(event, "widget", None)
-        record = self._steps_edit
-        if record is not None:
-            boxes, item_id = record
-            if hit in boxes:
-                return                       # 点的是某一条子步骤的输入框
-            if self._inside_steps_area(hit, item_id, event):
-                return                       # 点的是这一行的子步骤区（小方框 / 空隙）
-            self._end_steps_edit(save=True, incremental=True)
-            self._press = None               # 这一下只用来"退出编辑"，别再顺手勾选别的条目
-            return
-        entry = self._edit_entry
-        if entry is not None and hit is not entry:
-            self._end_edit(save=True, incremental=True)
-            self._press = None               # 同上：松手时不执行"点条目 = 勾选"
-        return
-
-    def _inside_steps_area(self, hit, item_id, event):
-        """点击是否落在"正在编辑子步骤的那一行"的子步骤区里（含小方框与框间空隙）。"""
-        row = self._row_widget(item_id)
-        if row is None or hit is not row:
-            return False
-        return getattr(event, "y", 0) >= getattr(row, "_step_top", 1e9)
-
-    def _clear_steps(self, item_id):
-        if self.store.set_steps(item_id, []) is not None:
-            if not self._redraw_row(item_id):
-                self._refresh()
-
-    # ---- 子步骤编辑（右键条目 → 编辑子步骤…）----
-    def _step_index_at(self, canvas, event):
-        """双击落在第几条子步骤上（靠行内已记下的小方框命中区算）。"""
-        y = getattr(event, "y", 0)
-        for index, y0, y1, _x0, _x1 in getattr(canvas, "_step_boxes", None) or []:
-            if y0 <= y < y1:
-                return index
-        return None
-
-    def _steps_editor_metrics(self, widget):
-        """子步骤编辑区在行内的顶端和每个输入框的行高。
-
-        顶端取自 _draw_row 记下的 canvas._step_top：它在**标题文字块**下面，
-        所以每个输入框都从子步骤那一行开始，不会盖住条目正文。
-        """
-        top = getattr(widget, "_step_top", None)
-        if top is None:
-            top = int(widget.cget("height")) - self.row_pad_y
-        line_h = self.fonts["small"].metrics("linespace") + self.px(2)
-        return int(top), int(line_h)
-
-    def _steps_edit_texts(self, boxes=None):
-        """把编辑中各输入框的文字读出来（不销毁输入框）。"""
-        if boxes is None:
-            record = self._steps_edit
-            boxes = record[0] if record is not None else []
-        texts = []
-        for box in boxes:
-            try:
-                texts.append(box.get("1.0", "end-1c"))
-            except tk.TclError:
-                texts.append("")
-        return texts
-
-    def _steps_edit_lines(self, text):
-        """一段子步骤文字在当前行宽下会占几个显示行（折行规则和列表里一致）。"""
-        limit = max(self.px(40), self.row_wrap - int(self.step_indent))
-        return max(1, len(self._wrap_text(text, self.fonts["small"], limit)))
-
-    def _steps_edit_check_at(self, x, y):
-        """编辑时：点在第几行的小方框上（横竖都算），返回行号；否则 None。"""
-        box = self.step_box
-        left = self.text_x
-        for index, (_y0, _height, cy) in enumerate(self._steps_edit_geom):
-            if (left - self.px(4) <= x <= left + box + self.px(4)
-                    and cy - box / 2.0 - self.px(2) <= y <= cy + box / 2.0 + self.px(2)):
-                return index
-        return None
-
-    def _steps_edit_nearest(self, y):
-        """编辑时：y 落在（或最靠近）第几个输入框。"""
-        best, best_dist = 0, None
-        for index, (y0, height, _cy) in enumerate(self._steps_edit_geom):
-            if y0 <= y <= y0 + height:
-                return index
-            dist = min(abs(y - y0), abs(y - (y0 + height)))
-            if best_dist is None or dist < best_dist:
-                best, best_dist = index, dist
-        return best
-
-    def _steps_edit_make_box(self, widget, text, done, index):
-        """子步骤编辑器里"一条子步骤一个输入框"（不是一个装下所有子步骤的大框）。"""
-        box = tk.Text(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
-                      relief="flat", bd=0, highlightthickness=0,
-                      font=self.fonts["small"], wrap="char",
-                      padx=0, pady=0, spacing1=0, spacing2=0, spacing3=0)
-        box.insert("1.0", text)
-        box.tag_configure("done", foreground=C_DONE, overstrike=1)
-        if done:
-            box.tag_add("done", "1.0", "1.end")
-        box.bind("<Escape>", self._steps_cancel_key)
-        box.bind("<Return>", self._steps_save_key)              # 回车＝保存退出
-        box.bind("<KP_Enter>", self._steps_save_key)            # 小键盘回车同样＝保存
-        box.bind("<Control-Return>", lambda event, i=index: self._steps_add_key(i))
-        box.bind("<FocusOut>", self._steps_focus_out)
-        box.bind("<<Modified>>", self._steps_modified)
-        box.bind("<Tab>", lambda event: self._steps_move_focus(1))
-        box.bind("<Shift-Tab>", lambda event: self._steps_move_focus(-1))
-        box.bind("<Down>", lambda event: self._steps_arrow_key(event, 1))
-        box.bind("<Up>", lambda event: self._steps_arrow_key(event, -1))
-        box.bind("<FocusIn>", lambda event, i=index: self._steps_edit_note_focus(i))
-        box.edit_modified(False)
-        return box
-
-    def _steps_edit_make_boxes(self, widget, texts, done, focus_index=None):
-        """按 texts / done 建一排输入框并摆好（加一步、删空行之后也走这里）。"""
-        record = self._steps_edit
-        if record is None:
-            return
-        for old in record[0]:
-            try:
-                old.destroy()
-            except tk.TclError:
-                pass
-        boxes = []
-        for index, text in enumerate(texts):
-            boxes.append(self._steps_edit_make_box(
-                widget, text, bool(done[index]) if index < len(done) else False, index))
-        self._steps_edit = (boxes, record[1])
-        self._steps_edit_done = [bool(value) for value in done]
-        self._steps_edit_layout()
-        if boxes:
-            self._steps_edit_focus(len(boxes) - 1 if focus_index is None else focus_index,
-                                   cursor_to_end=True)
-
-    def _steps_edit_layout(self):
-        """重新摆这一行：输入框一个接一个（中间留缝），小方框按新位置重画。"""
-        record = self._steps_edit
-        if record is None:
-            return
-        boxes, item_id = record
-        widget = self._row_widget(item_id)
-        if widget is None or not boxes:
-            return
-        top, line_h = self._steps_editor_metrics(widget)
-        linespace = self.fonts["small"].metrics("linespace")
-        gap = self.px(6)
-        left = self.text_x + int(self.step_indent)
-        width = max(self.px(40), self.row_wrap - int(self.step_indent))
-        y = top
-        geom = []
-        for box in boxes:
-            try:
-                text = box.get("1.0", "end-1c")
-            except tk.TclError:
-                text = ""
-            height = self._steps_edit_lines(text) * linespace + self.px(2)
-            try:
-                box.place(x=left, y=y, width=width, height=height)
-            except tk.TclError:
-                return
-            geom.append((y, height, y + linespace / 2.0))
-            y += height + gap
-        total = (y - gap - top) if boxes else 0
-        base_h = max(int(self._steps_edit_base_h), top + line_h + self.row_pad_y)
-        need = top + total + self.row_pad_y
-        new_h = max(base_h, need)
-        if int(widget.cget("height")) != new_h:
-            widget.configure(height=new_h)
-            self._steps_edit_grew = self._steps_edit_grew or new_h > base_h
-            try:
-                self.root.update_idletasks()
-                self._on_inner_configure()
-                self._resize()
-                self._reveal_steps_editor(widget)
-            except tk.TclError:
-                pass
-        self._steps_edit_geom = geom
-        widget.delete("steps-edit-check")
-        for index, (_y0, _height, cy) in enumerate(geom):
-            done = self._steps_edit_done[index] if index < len(self._steps_edit_done) else False
-            self._draw_step_check(widget, self.text_x, cy, done, tags="steps-edit-check")
-
-    def _steps_edit_focus(self, index, cursor_to_end=False):
-        """把焦点挪到第 index 个子步骤输入框（越界就夹到两端）。"""
-        record = self._steps_edit
-        if record is None or not record[0]:
-            return
-        try:
-            index = int(index)
-        except (TypeError, ValueError):
-            index = 0
-        index = max(0, min(index, len(record[0]) - 1))
-        try:
-            box = record[0][index]
-            box.focus_force()
-            if cursor_to_end:
-                box.mark_set("insert", "end-1c")
-            self._steps_edit_active = index
-        except tk.TclError:
-            pass
-
-    def _steps_edit_focus_index(self):
-        """当前聚焦第几个子步骤输入框（自检 / 驱动用）。"""
-        return self._steps_edit_active
-
-    def _steps_edit_toggle(self, index):
-        """编辑时点小方框：只改"编辑中"的勾选状态（保存时一起落盘），同步删除线。"""
-        record = self._steps_edit
-        if record is None:
-            return
-        try:
-            index = int(index)
-        except (TypeError, ValueError):
-            return
-        if not 0 <= index < len(record[0]):
-            return
-        done = list(self._steps_edit_done)
-        if index >= len(done):
-            done.extend([False] * (index + 1 - len(done)))
-        done[index] = not bool(done[index])
-        self._steps_edit_done = done
-        box = record[0][index]
-        try:
-            if done[index]:
-                box.tag_add("done", "1.0", "1.end")
-            else:
-                box.tag_remove("done", "1.0", "1.end")
-        except tk.TclError:
-            pass
-        self._steps_edit_focus(index)
-        self._steps_edit_layout()
-
-    def _begin_steps_edit(self, item_id, step_index=None):
-        """进入子步骤编辑：**每一条子步骤一个独立的输入框**，不再是装下所有子步骤的大框。
-
-        每条输入框都挨着自己那一行的小方框，框与框之间留缝，谁是谁一眼分得清；
-        条目正文和右侧按钮照常可见。回车＝保存退出、Ctrl+回车＝在下面加一步、
-        Esc＝取消、点别处也算保存。
-        """
-        self._cancel_regroup()
-        self._end_steps_edit(save=True)
-        if self._edit_entry is not None:
-            self._end_edit(save=True)
-        widget = self._row_widget(item_id)
-        item = self._find_item(item_id)
-        if widget is None or item is None:
-            return None
-        steps = self.store.steps_of(item)
-        texts = [step["text"] for step in steps] or [""]
-        done = [bool(step["done"]) for step in steps] or [False]
-        self._steps_edit_win = (self.root.winfo_width(), self.root.winfo_height())
-        self._steps_edit_grew = False
-        self._steps_edit_base_h = int(widget.cget("height"))
-        self._steps_edit_geom = []
-        self._steps_edit = ([], item_id)
-        widget.delete("step")       # 正常排版画的那排子步骤先撤掉，编辑时按新排版重画
-        focus_index = step_index if step_index is not None else len(texts) - 1
-        self._steps_edit_make_boxes(widget, texts, done, focus_index=focus_index)
-        self._update_hint()
-        try:
-            self.root.update_idletasks()
-            if widget.winfo_exists():
-                self._reveal_steps_editor(widget)
-        except tk.TclError:
-            pass
-        boxes = self._steps_edit[0] if self._steps_edit else []
-        return boxes[0] if boxes else None
-
-    def _steps_modified(self, event=None):
-        """某个子步骤框的内容变了：重排（文字变长折行 / 删字变短）并让光标露出来。"""
-        record = self._steps_edit
-        if record is None:
-            return
-        box = getattr(event, "widget", None) if event is not None else None
-        if box is None or box not in record[0]:
-            return
-        try:
-            if not box.edit_modified():
-                return                 # 复位标记本身会再触发一次 <<Modified>>，这里挡掉
-            box.edit_modified(False)
-        except tk.TclError:
-            return
-        self._steps_edit_layout()
-        try:
-            box.see("insert")
-        except tk.TclError:
-            pass
-
-    def _reveal_steps_editor(self, widget):
-        """这一行被撑高之后，保证它的底部在可视区域里（窗口加不高时靠列表滚动）。"""
-        try:
-            self.root.update_idletasks()
-            inner_h = max(1, self.inner.winfo_reqheight())
-            visible = self.canvas.winfo_height()
-            top = widget.winfo_y()
-            bottom = top + widget.winfo_height()
-            view_top = int(self.canvas.canvasy(0))
-        except tk.TclError:
-            return
-        if bottom > view_top + visible:
-            self.canvas.yview_moveto(max(0.0, min(1.0, (bottom - visible) / float(inner_h))))
-        elif top < view_top:
-            self.canvas.yview_moveto(max(0.0, top / float(inner_h)))
-
-    def _steps_edit_note_focus(self, index):
-        """用户用鼠标点到 / Tab 到某个框：记住它，Ctrl+回车加一步时以它为准。"""
-        try:
-            if 0 <= int(index) < len(self._steps_edit[0]):
-                self._steps_edit_active = int(index)
-        except (tk.TclError, TypeError, ValueError):
-            pass
-
-    def _steps_arrow_key(self, event, delta):
-        """上下方向键：光标还在长文本中间时照常移动光标，到边界才换到上/下一个框。"""
-        box = getattr(event, "widget", None)
-        try:
-            cursor = int(box.index("insert").split(".")[0])
-            last = int(box.index("end-1c").split(".")[0])
-        except (tk.TclError, AttributeError, ValueError):
-            return None
-        if (delta > 0 and cursor >= last) or (delta < 0 and cursor <= 1):
-            self._steps_move_focus(delta)
-            return "break"
-        return None
-
-    def _steps_move_focus(self, delta):
-        """Tab / 上下方向键：在子步骤输入框之间挪。"""
-        record = self._steps_edit
-        if record is None:
-            return "break"
-        current = self._steps_edit_active
-        self._steps_edit_focus((0 if current is None else current) + delta,
-                               cursor_to_end=True)
-        return "break"
-
-    def _steps_add_key(self, index=None, event=None):
-        """Ctrl+回车：在当前这条子步骤后面加一个空输入框。"""
-        record = self._steps_edit
-        if record is None:
-            return "break"
-        texts = self._steps_edit_texts()
-        done = list(self._steps_edit_done)
-        if len(texts) >= STEP_MAX:
-            self._flash_hint("一条待办最多 %d 个子步骤" % STEP_MAX)
-            return "break"
-        if index is None:
-            index = self._steps_edit_active
-        try:
-            index = int(index)
-        except (TypeError, ValueError):
-            index = len(texts) - 1
-        index = max(-1, min(index, len(texts) - 1))
-        texts.insert(index + 1, "")
-        done.insert(index + 1, False)
-        widget = self._row_widget(record[1])
-        if widget is not None:
-            self._steps_edit_make_boxes(widget, texts, done, focus_index=index + 1)
-        return "break"
-
-    def _steps_save_key(self, event=None):
-        """子步骤输入框里按回车：保存退出。"""
-        self._end_steps_edit(save=True)
-        return "break"                     # 别再往已销毁的框里插换行
-
-    def _steps_cancel_key(self, event=None):
-        """子步骤输入框里按 Esc：丢弃这次修改。"""
-        self._end_steps_edit(save=False)
-        return "break"
-
-    def _edit_focus_out(self, event=None):
-        """改标题的输入框失焦：稍后再判断是真"点到别处"还是窗口本身没焦点。"""
-        try:
-            self.root.after(1, self._edit_check_focus)
-        except tk.TclError:
-            pass
-
-    def _edit_check_focus(self):
-        """焦点明确落到别的控件上才算"点别处保存"。
-
-        `focus_get()` 返回 None 有两种情况：Tk 窗口本身没有 X 焦点（切到别的应用、
-        或者自动化测试里没抢到焦点），以及焦点落在不接收键盘输入的画布上。
-        这两种都不代表"用户点了别处"—— 真正点别处由 _on_global_click 处理。
-        """
-        entry = self._edit_entry
-        if entry is None:
-            return
-        try:
-            focus = self.root.focus_get()
-        except (tk.TclError, KeyError):
-            focus = None
-        if focus is None or focus is entry:
-            return
-        self._end_edit(save=True)
-
-    def _steps_focus_out(self, event=None):
-        """某个子步骤框失焦：可能只是换到另一个框，稍后再判断要不要收。"""
-        if self._steps_edit is None:
-            return
-        try:
-            self.root.after(1, self._steps_edit_check_focus)
-        except tk.TclError:
-            pass
-
-    def _steps_edit_check_focus(self):
-        """焦点确实离开整组输入框（点别处 / 窗口失焦）才算"点别处保存"。"""
-        record = self._steps_edit
-        if record is None:
-            return
-        try:
-            focus = self.root.focus_get()
-        except (tk.TclError, KeyError):
-            focus = None
-        if focus is None or focus in record[0]:
-            # None = 窗口本身没 X 焦点（切走 / 测试环境），不是"点了别处"；
-            # 真正的点别处由 _on_global_click 负责。
-            return
-        self._end_steps_edit(save=True)
-
-    def _end_steps_edit(self, save=True, incremental=False):
-        """收掉子步骤编辑器：save=False 直接丢弃；save=True 把每个框的文字写回（勾选照旧）。
-
-        incremental=True 只重画这一行（点别的条目退出编辑时用），理由同 _end_edit。
-        """
-        record, self._steps_edit = self._steps_edit, None
-        if record is None:
-            return False
-        boxes, item_id = record
-        grew, window = self._steps_edit_grew, self._steps_edit_win
-        self._steps_edit_grew = False
-        self._steps_edit_win = None
-        texts = self._steps_edit_texts(boxes)
-        done = list(self._steps_edit_done)
-        self._steps_edit_done = []
-        self._steps_edit_geom = []
-        self._steps_edit_active = None
-        for box in boxes:
-            try:
-                box.destroy()
-            except tk.TclError:
-                pass
-        widget = self._row_widget(item_id)
-        if widget is not None:
-            try:
-                widget.delete("steps-edit-check")
-            except tk.TclError:
-                pass
-        changed = False
-        if save:
-            steps = []
-            for index, text in enumerate(texts):
-                text = " ".join(str(text).split())
-                if not text:
-                    continue
-                steps.append({"text": text,
-                              "done": bool(done[index]) if index < len(done) else False})
-            changed = self.store.set_steps(item_id, steps) is not None
-        if incremental and widget is not None and self._redraw_row(item_id):
-            self._update_counts()
-            self._update_footer()
-        else:
-            self._refresh()
-        # 用户自己拉过窗口大小时，_resize() 只增不减 —— 编辑时撑高的那点要还回去，
-        # 否则每编辑一次窗口就长高一行。
-        if grew and window is not None and self._user_sized \
-                and int(window[0]) > 1 and int(window[1]) > 1:
-            try:
-                self.root.update_idletasks()
-                self.root.geometry("%dx%d" % (int(window[0]), int(window[1])))
-            except (tk.TclError, TypeError, ValueError):
-                pass
-        self._update_hint()
-        self._schedule_regroup()
-        return changed
-
-    def clear_done(self):
-        if self.store.clear_done():
-            self._refresh(keep_scroll=False)
-
-    def toggle_collapsed(self):
-        collapsing = not self.store.ui["collapsed"]
-        if collapsing:
-            try:
-                self._expanded_size = (self.root.winfo_width(), self.root.winfo_height())
-            except tk.TclError:
-                self._expanded_size = None
-        self.store.ui["collapsed"] = collapsing
-        self.store.save()
-        self._apply_collapsed()
-
-    def _apply_topmost(self):
-        value = bool(self._topmost_var.get())
-        self.store.ui["topmost"] = value
-        self.root.attributes("-topmost", value)
-        self.store.save()
-
-    def set_alpha(self, value, save=True):
-        """设置窗口透明度（0.3–1.0）；save=False 只预览，关对话框时再落盘。"""
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        value = max(0.3, min(1.0, value))
-        self.store.ui["alpha"] = value
-        try:
-            self.root.attributes("-alpha", value)
-        except tk.TclError:
-            pass
-        if save:
+            due = self.store.due_reminders()
+        except Exception:
+            due = []
+        if due:
+            for item in due:
+                item["remind_at"] = None
             self.store.save()
-        return value
-
-    def open_alpha_dialog(self):
-        """右键标题栏 →「窗口透明度…」：一条滑块，拖动即时预览，关掉即保存。"""
-        existing = self._alpha_dialog
-        if existing is not None:
+            for item in due:
+                self.redraw_row(item["id"])
+            self._update_footer()
+            self.show_alert(due)
             try:
-                if existing.winfo_exists():
-                    existing.lift()
-                    existing.focus_force()
-                    return existing
-            except tk.TclError:
+                if self.store.ui.get("sound", True):
+                    Gdk.beep()
+            except Exception:
                 pass
-        win = tk.Toplevel(self.root)
-        self._alpha_dialog = win
-        win.title("窗口透明度")
-        win.configure(bg=C_CARD)
-        win.transient(self.root)
-        win.resizable(False, False)
-        current = int(round(float(self.store.ui["alpha"]) * 100))
-        percent = tk.IntVar(master=win, value=current)
-        tk.Label(win, text="窗口透明度", bg=C_CARD, fg=C_DIM,
-                 font=self.fonts["small"]).pack(padx=self.px(14),
-                                                pady=(self.px(12), self.px(2)))
-        value_label = tk.Label(win, text="%d%%" % current, bg=C_CARD, fg=C_ACCENT,
-                               font=self.fonts["bold"])
-        value_label.pack()
-        scale = tk.Scale(win, from_=30, to=100, orient="horizontal",
-                         variable=percent, showvalue=0, length=self.px(200),
-                         bg=C_CARD, fg=C_DIM, troughcolor=C_BORDER,
-                         highlightthickness=0, bd=0, sliderrelief="raised",
-                         width=self.px(13), sliderlength=self.px(20),
-                         activebackground=C_ACCENT, relief="flat")
-        scale.pack(padx=self.px(14), pady=(self.px(2), self.px(4)))
+            if raise_it:
+                self.raise_window()
+        self._remind_job = GLib.timeout_add(
+            REMIND_POLL_MS, lambda: (self._remind_tick(True), False)[1])
+        return False
 
-        def preview(_event=None):
-            value = max(30, min(100, int(percent.get())))
-            value_label.configure(text="%d%%" % value)
-            self.set_alpha(value / 100.0, save=False)
+    def show_alert(self, items):
+        names = []
+        for item in items[:3]:
+            text = item["text"].strip()
+            names.append(text[:16] + ("…" if len(text) > 16 else ""))
+        self._alert = items
+        self.hint.get_style_context().add_class("warn")
+        self.hint.set_text("⏰ %s%s" % (tr("；", ", ").join(names),
+                                      tr(" 等 %d 条", " and %d more") % len(items)
+                                      if len(items) > 3 else ""))
+        self.alert_btn.set_no_show_all(False)
+        self.alert_btn.show()
+        self.undo_btn.hide()
 
-        def save_now(_event=None):
-            self.set_alpha(percent.get() / 100.0, save=True)
+    def dismiss_alert(self):
+        self._alert = None
+        self.alert_btn.hide()
+        self.hint.get_style_context().remove_class("warn")
+        self._update_footer()
 
-        def close(_event=None):
-            save_now()
+    def _remind_stop(self):
+        if self._remind_job is not None:
             try:
-                win.grab_release()
-            except tk.TclError:
+                GLib.source_remove(self._remind_job)
+            except Exception:
                 pass
-            win.destroy()
-            if self._alpha_dialog is win:
-                self._alpha_dialog = None
+            self._remind_job = None
 
-        scale.configure(command=preview)
-        scale.bind("<ButtonRelease-1>", save_now)
-        win.bind("<Escape>", close)
-        win.bind("<Destroy>", lambda event: save_now() if event.widget is win else None)
-        win.protocol("WM_DELETE_WINDOW", close)
-        tk.Label(win, text="拖动即时预览，关掉即保存", bg=C_CARD, fg=C_MUTED,
-                 font=self.fonts["small"]).pack(padx=self.px(14),
-                                                pady=(0, self.px(10)))
-        win.update_idletasks()
-        win.geometry("+%d+%d" % (self.root.winfo_rootx() + self.px(40),
-                                 self.root.winfo_rooty() + self.px(70)))
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
-        scale.focus_set()
-        return win
+    # ---- 归档 ----
+    def _archive_on_start(self):
+        self._archive_tick()
 
-    def _toggle_autostart(self):
-        """右键菜单勾「开机自启」：装/拆自启项，不用再让用户去终端敲参数。"""
-        want = bool(self._autostart_var.get())
-        if want:
-            autostart_install()
-        else:
-            autostart_uninstall()
-        self._autostart_var.set(os.path.exists(autostart_path()))
-        self._flash_hint("已开启开机自启" if want else "已关闭开机自启")
+    def _archive_tick(self):
+        day = self.store.day_start()
+        if self._archived_day == day:
+            return 0
+        self._archived_day = day
+        moved = self.store.archive_completed()
+        if moved:
+            self.render()
+        return moved
 
+    # ---- 唤回 ----
+    def raise_window(self, timestamp=None):
+        activate_window(self.root, self.store.ui["topmost"], timestamp=timestamp or 0)
+
+    def add_from_ipc(self, text):
+        """另一个进程通过套接字加一条（--add）：不新开窗口、不抢焦点。"""
+        item = self.store.add(text)
+        if item is None:
+            return
+        self.render(keep_scroll=False)
+        self.flash_hint(tr("已添加：%s", "Added: %s") % item["text"])
+        if self.store.ui.get("collapsed"):
+            self.toggle_collapsed()
+
+    def _bind_wheel(self, widget):
+        widget.add_events(Gdk.EventMask.SCROLL_MASK)
+        widget.connect("scroll-event", self._on_wheel)
+
+    def _on_wheel(self, _widget, event):
+        if event.direction in (Gdk.ScrollDirection.UP, Gdk.ScrollDirection.SMOOTH):
+            dy = event.delta_y if hasattr(event, "delta_y") else -2.0
+            self.scrolled.get_vadjustment().set_value(
+                self.scrolled.get_vadjustment().get_value() + dy * 12)
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            self.scrolled.get_vadjustment().set_value(
+                self.scrolled.get_vadjustment().get_value() + 24)
+        return True
+
+    # ---- 退出 ----
     def quit(self):
+        if getattr(self, "_quitting", False):
+            return False
+        self._quitting = True
         try:
-            self.store.ui["x"] = self.root.winfo_x()
-            self.store.ui["y"] = self.root.winfo_y()
-        except tk.TclError:
+            x, y = self.win.get_position()
+            self.store.ui["x"] = int(x)
+            self.store.ui["y"] = int(y)
+        except Exception:
             pass
-        self._stop_autoscroll()
+        self._remind_stop()
         self._cancel_regroup()
-        hotkey_remove()                           # 解掉全局快捷键（不然退出后那个键还空占着）
+        hotkey_remove()
         single_instance_stop(self.root)
-        self.store.resort()                       # 退出前把顺序归位，文件里也是分好组的
+        self.store.resort()
         self.store.save()
-        self.root.destroy()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
+        return False
+
 
 
 # --------------------------------------------------------------------------- #
 # 归档浏览器
 # --------------------------------------------------------------------------- #
-_ARCHIVE_REASON = {          # archive.reason → (给用户看的词, 颜色)
-    "done": ("完成", C_DIM),        # 过了 00:00 自动收走的
-    "cleared": ("清掉", C_DIM),     # 点「归档已完成」收走的
-    "deleted": ("删除", C_DANGER),  # 点 × 删掉的
-}
-
-
 class ArchiveWindow(object):
-    """只读的归档浏览器：列出 `archive` 段，点「恢复」把一条放回列表。
+    """查看归档（完成的 / 清掉的 / 删掉的），挑一条恢复回列表。"""
 
-    为什么单开一个窗口（而不是嵌进挂件里）：归档最多能存 500 条，塞进 300px 宽的挂件
-    会把待办列表挤没；而且它只是"翻旧账"，翻完就该关掉 —— 所以用**非模态** Toplevel，
-    主窗口照常能用。观感沿用主面板那套缩放系数与配色，窗口同样不进任务栏。
-    """
+    REASONS = {
+        "done": (tr("完成", "Done"), "badge today"),
+        "cleared": (tr("清掉", "Cleared"), "badge mid"),
+        "deleted": (tr("删除", "Deleted"), "badge hi"),
+    }
 
-    WIDTH = 380          # 设计宽度（会按界面缩放放大）
-    MAX_LIST_H = 420     # 列表区最高；超出就滚轮
+    def __init__(self, app):
+        self.app = app
+        self._drag = None
+        self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self.win.set_title(tr("归档 · 桌面待办清单", "Archive · Desktop To-do"))
+        self.win.set_decorated(False)
+        self.win.set_skip_taskbar_hint(True)
+        self.win.set_skip_pager_hint(True)
+        self.win.set_transient_for(app.win)
+        self.win.set_destroy_with_parent(True)
+        self.win.set_default_size(360, 420)
+        self.win.connect("key-press-event", self._on_key)
 
-    def __init__(self, owner, visible=True):
-        self.owner = owner
-        self.store = owner.store
-        self.s = owner.s
-        self._drag_offset = None
-        self._rows = []                  # 每行一个 Frame（自检按它数行）
-        self._window_item = None
-        self.win = tk.Toplevel(owner.root)
-        self.win.withdraw()              # 先别映射：去标题栏的提示要在建图前生效
-        self.win.title("归档 · 桌面待办清单")
-        self.win.configure(bg=C_BORDER)
-        self.win.transient(owner.root)   # 跟主窗口绑定：总在它上面，也不单独占一个任务栏项
-        self.win.protocol("WM_DELETE_WINDOW", self.close)
-        self.win.bind("<Escape>", lambda event: self.close())
-        self.width = owner.px(self.WIDTH)
-        self._build()
-        if visible:
-            self.show()
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class("card")
+        self.win.add(card)
 
-    # ---- 组装 ----
-    def _build(self):
-        px = self.owner.px
-        self.card = tk.Frame(self.win, bg=C_CARD)
-        self.card.pack(fill="both", expand=True, padx=1, pady=1)
+        header_event = Gtk.EventBox()
+        header_event.set_visible_window(False)
+        header_event.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                                | Gdk.EventMask.BUTTON_RELEASE_MASK
+                                | Gdk.EventMask.POINTER_MOTION_MASK)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_start(16)
+        header.set_margin_end(10)
+        header.set_margin_top(12)
+        header.set_margin_bottom(8)
+        header_event.add(header)
+        header_event.connect("button-press-event", self._on_header_press)
+        header_event.connect("button-release-event", self._on_header_release)
+        header_event.connect("motion-notify-event", self._on_header_motion)
+        self.title = Gtk.Label(label=tr("归档", "Archive"), xalign=0.0)
+        self.title.get_style_context().add_class("title")
+        header.pack_start(self.title, True, True, 0)
+        export_btn = Gtk.Button(label=tr("导出…", "Export…"))
+        export_btn.get_style_context().add_class("linkbtn")
+        export_btn.set_relief(Gtk.ReliefStyle.NONE)
+        export_btn.set_tooltip_text(tr("导出全部待办和归档为 JSON 备份",
+                                              "Export all to-dos and archive as JSON"))
+        export_btn.connect("clicked", lambda _b: self._export_dialog())
+        header.pack_end(export_btn, False, False, 0)
+        close = icon_button("window-close-symbolic", 15, tooltip=tr("关闭", "Close"))
+        close.connect("clicked", lambda _b: self.close())
+        header.pack_end(close, False, False, 0)
+        card.pack_start(header_event, False, False, 0)
 
-        head = tk.Frame(self.card, bg=C_CARD)
-        head.pack(fill="x", padx=px(10), pady=(px(8), px(4)))
-        title = tk.Label(head, text="归档", bg=C_CARD, fg=C_TEXT,
-                         font=self.owner.fonts["bold"])
-        title.pack(side="left")
-        self.count = tk.Label(head, text="", bg=C_CARD, fg=C_DIM,
-                              font=self.owner.fonts["small"])
-        self.count.pack(side="left", padx=(px(8), 0))
-        close_btn = tk.Label(head, text="×", bg=C_CARD, fg=C_MUTED,
-                             font=self.owner.fonts["bold"], cursor="hand2")
-        close_btn.pack(side="right")
-        close_btn.bind("<Button-1>", lambda event: self.close())
-        close_btn.bind("<Enter>", lambda event: close_btn.configure(fg=C_TEXT))
-        close_btn.bind("<Leave>", lambda event: close_btn.configure(fg=C_MUTED))
-        for widget in (head, title, self.count):
-            widget.bind("<Button-1>", self._drag_start)
-            widget.bind("<B1-Motion>", self._drag_move)
-            widget.bind("<ButtonRelease-1>", self._drag_end)
+        self.listbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_max_content_height(420)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_margin_start(8)
+        scrolled.set_margin_end(8)
+        scrolled.set_margin_bottom(8)
+        scrolled.add(self.listbox)
+        card.pack_start(scrolled, True, True, 0)
+        self.scrolled = scrolled
 
-        self.canvas = tk.Canvas(self.card, bg=C_LIST, highlightthickness=0, bd=0)
-        self.canvas.pack(fill="both", expand=True, padx=1)
-        self.inner = tk.Frame(self.canvas, bg=C_LIST)
-        self._window_item = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", self._on_inner_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        for widget in (self.canvas, self.inner):
-            widget.bind("<Button-4>", self._on_wheel)
-            widget.bind("<Button-5>", self._on_wheel)
-            widget.bind("<MouseWheel>", self._on_wheel)
-
-        self.hint = tk.Label(self.card, text="", bg=C_CARD, fg=C_MUTED,
-                             font=self.owner.fonts["small"], anchor="w")
-        self.hint.pack(fill="x", padx=px(10), pady=(px(4), px(8)))
         self.refresh()
+        self.win.show_all()
+        self._place()
+        self.win.connect("destroy", lambda _w: self._on_destroy())
 
+    # ---- 位置 ----
+    def _place(self):
+        screen_w, screen_h = screen_size()
+        try:
+            main_x, main_y = self.app.win.get_position()
+            main_w, main_h = self.app.win.get_size()
+        except Exception:
+            main_x, main_y, main_w, main_h = 0, 0, 360, 480
+        width, height = self.win.get_size()
+        x = main_x + main_w - width
+        y = main_y + main_h - height
+        x = max(0, min(x, screen_w - width))
+        y = max(0, min(y, screen_h - height))
+        self.win.move(int(x), int(y))
+
+    # ---- 列表 ----
     def refresh(self):
-        """重建列表（归档变了之后调用）。"""
-        for child in list(self.inner.winfo_children()):
+        for child in self.listbox.get_children():
             child.destroy()
-        self._rows = []
-        records = sorted(self.store.archive,
-                         key=lambda record: record.get("archived_at") or 0, reverse=True)
+        records = sorted(self.app.store.archive,
+                         key=lambda record: record.get("archived_at") or 0,
+                         reverse=True)
+        self.title.set_text(tr("归档", "Archive") if not records
+                          else tr("归档 · %d 条", "Archive · %d") % len(records))
         if not records:
-            tk.Label(self.inner,
-                     text="归档是空的。\n过了 00:00 收走的已完成、点「归档已完成」收走的、\n"
-                          "点 × 删掉的，都会留在这里（最多 %d 条）。" % ARCHIVE_MAX,
-                     bg=C_LIST, fg=C_MUTED, font=self.owner.fonts["small"],
-                     justify="left", anchor="w").pack(
-                fill="x", padx=self.owner.px(10), pady=self.owner.px(16))
-        for record in records:
-            self._rows.append(self._make_row(record))
-        self.count.configure(text="%d 条" % len(records))
-        self.hint.configure(text="点「恢复」把一条放回列表 · Esc 或 × 关闭", fg=C_MUTED)
-        self._fit()
+            tip = Gtk.Label(label=tr("还没有归档。\n完成的、清掉的、删掉的条目都会留在这里。",
+                               "No archive yet.\nCompleted, cleared and deleted items are kept here."))
+            tip.set_justify(Gtk.Justification.CENTER)
+            tip.get_style_context().add_class("empty-sub")
+            tip.set_margin_top(24)
+            tip.set_margin_bottom(24)
+            self.listbox.pack_start(tip, False, False, 0)
+        else:
+            for record in records:
+                self.listbox.pack_start(self._make_row(record), False, False, 0)
+        self.listbox.show_all()
 
     def _make_row(self, record):
-        px = self.owner.px
         item = record.get("item") or {}
-        reason = record.get("reason") or "done"
-        label, color = _ARCHIVE_REASON.get(reason, ("完成", C_DIM))
-        row = tk.Frame(self.inner, bg=C_LIST)
-        row.pack(fill="x", padx=px(8), pady=(px(6), px(4)))
+        reason = self.REASONS.get(record.get("reason") or "done",
+                                       (tr("完成", "Done"), "badge today"))
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_margin_start(8)
+        row.set_margin_end(8)
+        row.set_margin_top(6)
+        row.set_margin_bottom(6)
+        badge = Gtk.Label(label=reason[0])
+        badge.get_style_context().add_class("badge")
+        badge.get_style_context().add_class(reason[1])
+        badge.set_valign(Gtk.Align.START)
+        row.pack_start(badge, False, False, 0)
 
-        meta = tk.Frame(row, bg=C_LIST)
-        meta.pack(fill="x")
-        tk.Label(meta, text=label, bg=C_LIST, fg=color,
-                 font=self.owner.fonts["small"]).pack(side="left")
-        when = time.strftime("%Y-%m-%d %H:%M",
-                             time.localtime(record.get("archived_at") or 0))
-        tk.Label(meta, text=when, bg=C_LIST, fg=C_MUTED,
-                 font=self.owner.fonts["small"]).pack(side="left", padx=(px(6), 0))
-        restore = tk.Label(meta, text="恢复", bg=C_LIST, fg=C_ACCENT,
-                           font=self.owner.fonts["small"], cursor="hand2")
-        restore.pack(side="right")
-        restore.bind("<Button-1>", lambda event, rec=record: self.restore(rec))
-        restore.bind("<Enter>", lambda event: restore.configure(fg=C_TEXT))
-        restore.bind("<Leave>", lambda event: restore.configure(fg=C_ACCENT))
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text = Gtk.Label(label=str(item.get("text") or "（空）"), xalign=0.0)
+        text.set_line_wrap(True)
+        text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        text.get_style_context().add_class("step")
+        when = record.get("archived_at")
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if when else ""
+        meta = Gtk.Label(label=stamp, xalign=0.0)
+        meta.get_style_context().add_class("meta")
+        body.pack_start(text, False, False, 0)
+        body.pack_start(meta, False, False, 0)
+        row.pack_start(body, True, True, 0)
 
-        tk.Label(row, text=item.get("text") or "(无正文)", bg=C_LIST, fg=C_TEXT,
-                 font=self.owner.fonts["base"], wraplength=self.width - px(40),
-                 justify="left", anchor="w").pack(fill="x", pady=(px(2), 0))
-        tk.Frame(self.inner, bg=C_BORDER, height=1).pack(fill="x", padx=px(8))
+        restore = Gtk.Button(label=tr("恢复", "Restore"))
+        restore.connect("clicked", lambda _b, r=record: self._restore(r))
+        row.pack_end(restore, False, False, 0)
         return row
 
-    # ---- 动作 ----
-    def restore(self, record):
-        """把归档里的一条放回列表；成功返回 True（失败只改底部提示）。"""
-        index = record.get("index") or 0
-        if not self.store.restore({"item": record.get("item"), "index": index}):
-            self.hint.configure(text="这一条已经在列表里了", fg=C_DANGER)
+    def _restore(self, record):
+        if self.app.store.restore(record):
+            self.app.render()
+            self.refresh()
+            self.app.flash_hint(tr("已恢复 1 条", "Restored 1 item"))
+            return True
+        self.app.flash_hint(tr("这一条已经在列表里了", "That item is already in the list"))
+        return False
+
+    def _export_dialog(self):
+        """从归档窗口导出完整数据（JSON）；失败不打断主窗口。"""
+        dialog = Gtk.FileChooserDialog(
+            title=tr("导出待办数据", "Export to-do data"), transient_for=self.win,
+            action=Gtk.FileChooserAction.SAVE)
+        dialog.add_buttons(tr("取消", "Cancel"), Gtk.ResponseType.CANCEL,
+                           tr("导出", "Export"), Gtk.ResponseType.ACCEPT)
+        dialog.set_do_overwrite_confirmation(True)
+        dialog.set_current_name("desktop-todo-%s.json"
+                                % time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            if dialog.run() == Gtk.ResponseType.ACCEPT:
+                path = dialog.get_filename()
+                if path:
+                    count = self.app.store.export_json(path)
+                    self.app.flash_hint(tr("已导出 %d 条到 %s", "Exported %d items to %s")
+                                        % (count, os.path.basename(path)))
+        except (IOError, OSError) as error:
+            self.app.flash_hint(tr("导出失败：%s", "Export failed: %s") % (error,))
+        finally:
+            dialog.destroy()
+
+    # ---- 交互 ----
+    def _on_header_press(self, _widget, event):
+        if event.button != 1:
             return False
-        self.store.resort(save=True)          # 放回去就按状态归位（不必等延迟归位）
-        self.owner._refresh(keep_scroll=False)
-        self.refresh()
+        x, y = self.win.get_position()
+        self._drag = {"x": int(event.x_root - x), "y": int(event.y_root - y)}
         return True
 
-    # ---- 显示 / 关闭 / 拖动 ----
+    def _on_header_motion(self, _widget, event):
+        if getattr(self, "_drag", None) is None:
+            return False
+        if not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        self.win.move(int(event.x_root - self._drag["x"]),
+                      int(event.y_root - self._drag["y"]))
+        return True
+
+    def _on_header_release(self, _widget, event):
+        if event.button == 1:
+            self._drag = None
+        return False
+
+    def _on_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+    def _on_destroy(self):
+        if self.app._archive_window is self:
+            self.app._archive_window = None
+
     def show(self):
-        """显示并提到最前（已开着时走这里，不重建窗口）。"""
         self.refresh()
-        self.win.update_idletasks()
-        strip_window_decorations(self.win)
-        set_skip_taskbar(self.win)            # 建图前先写属性
-        x, y = self._place()
-        self.win.geometry("+%d+%d" % (x, y))
-        self.win.deiconify()
-        # 映射后再补一次：KWin 只对**已托管**的窗口处理那条 ClientMessage。
-        # 少了这一句，归档窗口会在 dock 里多出一个 Tk 默认图标的图标（实测过）。
-        self.win.update_idletasks()
-        set_skip_taskbar(self.win)
-        self.win.lift()
-        try:
-            self.win.focus_force()
-        except tk.TclError:
-            pass
+        self.win.show_all()
+        self.win.present()
+        return self
 
     def close(self):
-        """关掉窗口（幂等），顺手清掉主窗口留的引用。"""
-        if getattr(self.owner, "_archive_window", None) is self:
-            self.owner._archive_window = None
-        try:
-            self.win.destroy()
-        except tk.TclError:
-            pass
+        self.win.destroy()
 
-    def _place(self):
-        """贴着主窗口的右下角放（超出屏幕就往回收）。"""
-        px = self.owner.px
-        try:
-            rx, ry = self.owner.root.winfo_rootx(), self.owner.root.winfo_rooty()
-            rw = self.owner.root.winfo_width()
-        except tk.TclError:
-            rx, ry, rw = 0, 0, self.width
-        x = rx + rw - self.width
-        y = ry + px(40)
-        screen_w = self.win.winfo_screenwidth()
-        screen_h = self.win.winfo_screenheight()
-        x = max(px(4), min(x, screen_w - self.width - px(4)))
-        y = max(px(4), min(y, screen_h - px(200)))
-        return x, y
-
-    def _fit(self):
-        """按内容定窗口高度（列表区最多 MAX_LIST_H）。"""
-        px = self.owner.px
-        self.canvas.configure(height=px(60))
-        self.win.update_idletasks()
-        chrome = self.card.winfo_reqheight() - self.canvas.winfo_reqheight()
-        content = max(px(60), min(self.inner.winfo_reqheight(), px(self.MAX_LIST_H)))
-        self.canvas.configure(height=content)
-        self.win.geometry("%dx%d" % (self.width, chrome + content))
-
-    def _drag_start(self, event):
-        self._drag_offset = (event.x_root - self.win.winfo_x(),
-                             event.y_root - self.win.winfo_y())
-
-    def _drag_move(self, event):
-        if self._drag_offset is None:
-            return
-        offset_x, offset_y = self._drag_offset
-        self.win.geometry("+%d+%d" % (event.x_root - offset_x, event.y_root - offset_y))
-
-    def _drag_end(self, event):
-        self._drag_offset = None
-
-    # ---- 滚动 ----
-    def _on_inner_configure(self, event=None):
-        self.canvas.configure(scrollregion=(0, 0, self.inner.winfo_reqwidth(),
-                                            self.inner.winfo_reqheight()))
-
-    def _on_canvas_configure(self, event):
-        if self._window_item is not None:
-            self.canvas.itemconfigure(self._window_item, width=event.width)
-
-    def _on_wheel(self, event):
-        if self.inner.winfo_reqheight() <= int(self.canvas.cget("height")):
-            return "break"
-        up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
-        self.canvas.yview_scroll(-2 if up else 2, "units")
-        return "break"
 
 
 # --------------------------------------------------------------------------- #
-# 自检 / 自启动
+# 自检（--check）
 # --------------------------------------------------------------------------- #
 def run_check():
     """数据读写与界面构造自检，成功打印 SELFTEST OK 并返回 0。"""
     import tempfile
 
-    if tk is None:
-        sys.stderr.write("自检失败: 缺少 tkinter（统信 UOS / Debian: "
-                         "sudo apt install python3-tk）\n")
+    if Gtk is None:
+        sys.stderr.write("自检失败: 缺少 python3-gi / GTK3（统信 UOS / Debian: "
+                         "sudo apt install python3-gi gir1.2-gtk-3.0）\n")
         return 1
-
+    try:                            # 勾选圆是 cairo 自绘的，自检要验它的抗锯齿
+        import cairo
+    except ImportError:
+        cairo = None
+    install_css()
     problems = []
     temp_dir = tempfile.mkdtemp(prefix="desktop-todo-check-")
     try:
@@ -4241,12 +4670,105 @@ def run_check():
         reloaded = Store(path)
         if len(reloaded.items) != 2 or reloaded.remaining() != 2:
             problems.append("重新读取后条目不一致")
+        if Store(path).ui.get("sound") is not True:
+            problems.append("ui 默认没有提醒声音开关")
 
         reloaded.toggle(second["id"])
         if reloaded.remaining() != 1 or not reloaded.has_done():
             problems.append("切换完成状态失败")
         if Store(path).remaining() != 1:
             problems.append("完成状态未落盘")
+
+        # ---- 备份 / 导出 / 导入 ----
+        json_path = os.path.join(temp_dir, "backup.json")
+        if reloaded.export_json(json_path) != len(reloaded.items):
+            problems.append("导出 JSON 的条目数不对")
+        if not os.path.exists(json_path):
+            problems.append("导出 JSON 没有生成")
+        restore_store = Store(os.path.join(temp_dir, "restore.json"))
+        try:
+            got_items, _got_archive = restore_store.import_json(json_path)
+        except ValueError as error:
+            problems.append("导入自己导出的 JSON 失败: %r" % (error,))
+        else:
+            if got_items != len(reloaded.items):
+                problems.append("导入后条目数不一致")
+            if sorted(i["id"] for i in restore_store.items) != \
+                    sorted(i["id"] for i in reloaded.items):
+                problems.append("导入后条目 id 不一致")
+            # 导入后按状态归位（resort）是预期行为，比较内容时按 id 对齐
+            if sorted((i["id"], i["text"]) for i in restore_store.items) != \
+                    sorted((i["id"], i["text"]) for i in reloaded.items):
+                problems.append("导入后条目内容不一致")
+        csv_path = os.path.join(temp_dir, "backup.csv")
+        if reloaded.export_csv(csv_path) != len(reloaded.items):
+            problems.append("导出 CSV 的行数不对")
+        with open(csv_path, "r", encoding="utf-8-sig") as handle:
+            if len(handle.read().strip().splitlines()) != len(reloaded.items) + 1:
+                problems.append("CSV 应是表头 + 每条一行")
+
+        # ---- 数据格式版本 ----
+        # 1) 没有 version 字段的旧文件：按 v1 读
+        legacy_path = os.path.join(temp_dir, "legacy.json")
+        with open(legacy_path, "w", encoding="utf-8") as handle:
+            json.dump({"items": [{"id": 7, "text": "老格式", "done": True}],
+                       "archive": [], "ui": {}}, handle, ensure_ascii=False)
+        legacy = Store(legacy_path)
+        if len(legacy.items) != 1 or legacy.state_of(legacy.items[0]) != STATE_DONE:
+            problems.append("没有 version 字段的旧文件没有按 v1 读出")
+        # 2) 版本过新：拒绝读取、原文件移到 .newer，绝不能读成空清单再覆盖
+        newer_path = os.path.join(temp_dir, "newer.json")
+        with open(newer_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": DATA_VERSION + 1,
+                       "items": [{"id": 1, "text": "未来格式"}],
+                       "archive": [], "ui": {}}, handle, ensure_ascii=False)
+        guard = Store(newer_path)
+        if not guard.load_error:
+            problems.append("过高版本的数据文件没有被拒绝读取")
+        if guard.items:
+            problems.append("过高版本的数据文件不应读出条目")
+        if os.path.exists(newer_path):
+            problems.append("过高版本的数据文件应被移走（否则会被空清单覆盖）")
+        if not os.path.exists(newer_path + ".newer"):
+            problems.append("过高版本的数据文件没有留下 .newer 备份")
+
+        # ---- todo.txt 导入 ----
+        parsed = parse_todotxt(
+            "x 2026-01-01 2026-01-02 已完成的一条\n"
+            "(A) 高优先级 @电话 due:2026-12-31\n"
+            "\n"
+            "普通一条\n")
+        if len(parsed) != 3:
+            problems.append("parse_todotxt 行数不对: %r" % (len(parsed),))
+        else:
+            if not parsed[0]["done"]:
+                problems.append("parse_todotxt 没认出 x 完成行")
+            if parsed[1]["priority"] != PRIORITY_HIGH:
+                problems.append("parse_todotxt 没认出 (A) 优先级")
+            if parsed[1]["due"] is None:
+                problems.append("parse_todotxt 没认出 due:")
+            if "@电话" not in parsed[1]["text"]:
+                problems.append("parse_todotxt 不该吃掉 @context")
+        todo_path = os.path.join(temp_dir, "todo.txt")
+        with open(todo_path, "w", encoding="utf-8") as handle:
+            handle.write("(A) 导入一条 @电话\nx 已完成的一条\n")
+        merge_store = Store(os.path.join(temp_dir, "merge.json"))
+        added = merge_store.import_todotxt(todo_path)
+        if added != 2:
+            problems.append("import_todotxt 新增条数不对: %r" % (added,))
+        if not any(merge_store.state_of(i) == STATE_DONE for i in merge_store.items):
+            problems.append("import_todotxt 没导入已完成条目")
+        if not any(merge_store.priority_of(i) == PRIORITY_HIGH
+                   for i in merge_store.items):
+            problems.append("import_todotxt 没导入优先级")
+
+        # ---- 单实例命令解析（--add 走同一条套接字）----
+        if parse_ipc(b"raise\n") != ("raise", None):
+            problems.append("parse_ipc 没把 raise 认出来")
+        if parse_ipc("add\t买牛奶\n".encode("utf-8")) != ("add", "买牛奶"):
+            problems.append("parse_ipc 没把 add 命令 / 文本认出来")
+        if parse_ipc(b"")[0] != "raise":
+            problems.append("空消息应按 raise 处理")
 
         # ---- 三态：未完成 / 等待中 / 已完成 ----
         # 「等待中」= 已经着手，但在等别人反馈，自己现在动不了：既不算完成，也不该混在待办里催自己。
@@ -4449,7 +4971,8 @@ def run_check():
                 problems.append("认不出的提醒时间应当返回 None: %r" % (bad,))
         if format_remind_time(base + 30 * 60, now=base) != "09:30":
             problems.append("format_remind_time 当天格式不对")
-        if not format_remind_time(base + 23 * 3600, now=base).startswith("明天"):
+        if not format_remind_time(base + 23 * 3600, now=base).startswith(
+                tr("明天", "tomorrow")):
             problems.append("format_remind_time 明天格式不对")
 
         remind = Store(os.path.join(temp_dir, "remind.json"))
@@ -4478,7 +5001,7 @@ def run_check():
         # ---- 默认排序：未完成 → 等待中 → 已完成（同组内保持手动顺序）----
         order = Store(os.path.join(temp_dir, "order.json"))
         a = order.add("A")            # 顺序：A B C D（新增插到最前）
-        b = order.add("B")
+        order.add("B")
         c = order.add("C")
         d = order.add("D")
         order.toggle(d["id"])                    # D 已完成
@@ -4576,1081 +5099,267 @@ def run_check():
         if not os.path.exists(path + ".broken"):
             problems.append("损坏的数据文件未备份")
 
-        # 界面构造（窗口保持隐藏，跑一轮事件循环）
+        # ---- GTK 界面构造（窗口保持隐藏，不打扰桌面）----
+        win = None
         try:
-            root = tk.Tk()
-            widget = TodoWidget(root, broken, visible=False)   # 自检不打扰桌面
-            for text in ("界面自检一", "界面自检二", "界面自检三"):
-                broken.add(text)
-            widget._refresh()
-            widget.toggle_collapsed()
-            if widget._expanded_size is None:
-                problems.append("折叠时没有记住展开尺寸（展开就回不到原高度）")
-            if widget.list_area.winfo_manager() != "":
-                problems.append("折叠之后列表还占着位置（窗口没真收起来）")
-            widget.toggle_collapsed()
-            if widget._expanded_size is not None:
-                problems.append("展开之后还留着折叠前的尺寸记录")
-            if widget.list_area.winfo_manager() == "":
-                problems.append("展开之后列表没有回来")
-            widget.clear_done()
-            # 拖拽排序的代码路径（隐藏窗口下不校验落点几何，只验证能跑通、状态能收尾）
-            widget._begin_drag(broken.items[0]["id"])
-            widget._drag_to(widget.row_widgets[-1][1].winfo_rooty() + 1)
-            if widget._drag_id is None:
-                problems.append("拖动状态未建立")
-            widget._end_drag()
-            if widget._drag_id is not None:
-                problems.append("拖动状态未清理")
-            widget._refresh()
-            # 勾选必须原地重画：行控件对象要活下来，否则 Tk 永远配不出 <Double-Button-1>
-            # （这就是「双击改文字真机上没反应」的根因，用对象同一性在这里卡住）
-            target = broken.items[0]
-            row_before = widget._row_widget(target["id"])
-            widget.toggle_item(target["id"])
-            if widget._row_widget(target["id"]) is not row_before:
-                problems.append("勾选后行控件被重建了（双击会因此失效）")
-            # 原地重画还得真把内容改掉：勾选框在「已完成」时是 2 个图元（底 + 勾），
-            # 未完成时 1 个（只有边框）。数量不对说明这一行没按新状态重画。
-            expect_marks = 2 if target["done"] else 1
-            if len(row_before.find_withtag("check")) != expect_marks:
-                problems.append("勾选后行内容没有重画（原地更新失效）")
-            if getattr(row_before, "_delete_item", None) is None:
-                problems.append("重画后删除按钮的图元引用丢了")
-            if widget._edit_entry is not None:
-                problems.append("勾选不该进入编辑状态")
-            # 双击手势：第一下按「单击＝勾选」处理，进编辑时要把那一下撤回来，
-            # 且必须真的进入编辑状态（隐藏窗口下用桩事件走 _row_press/_row_release）
-            class _StubEvent(object):
-                def __init__(self, x, y_root=0, y=0):
-                    self.x = x
-                    self.y_root = y_root
-                    self.y = y
+            ui_path = os.path.join(temp_dir, "ui.json")
+            ui_store = Store(ui_path)
+            first = ui_store.add("界面自检一")
+            second = ui_store.add("界面自检二 @工作")
+            third = ui_store.add("界面自检三")
+            win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            app = TodoWindow(win, ui_store, visible=False)
+            app.render(keep_scroll=False)
+            if len(app.row_widgets) != 3:
+                problems.append("界面没把 3 条都排出来: %r" % (len(app.row_widgets),))
+            if tr("3 项未完成", "3 unfinished") not in app.count.get_text():
+                problems.append("摘要没显示 3 项未完成: %r" % (app.count.get_text(),))
 
-            done_before = target["done"]
-            body_x = widget.text_x
-            widget._row_press(_StubEvent(x=body_x), target["id"])
-            widget._row_release(_StubEvent(x=body_x))
-            if target["done"] == done_before:
-                problems.append("单击没有切换完成状态")
-            widget._begin_edit(target["id"], _StubEvent(x=body_x))
-            if target["done"] != done_before:
-                problems.append("双击进编辑时没有撤回第一下的勾选")
-            if widget._edit_entry is None:
-                problems.append("双击编辑没有进入编辑状态")
+            # 勾选只重画该行（不重建控件）——双击改名能工作、也不卡的前提。
+            # 先让「已完成」组存在，这样这次勾选只改计数、不改变分组结构。
+            ui_store.toggle(second["id"])
+            app.render(keep_scroll=False)
+            row_before = app.rows.get(first["id"])
+            app.toggle_item(first["id"])
+            row_after = app.rows.get(first["id"])
+            if row_after is not row_before:
+                problems.append("勾选把行控件重建了（应当原地重画）")
+            if ui_store.state_of(app.find_item(first["id"])) != STATE_DONE:
+                problems.append("勾选没有把状态改成已完成")
+            if not row_after.check.done:
+                problems.append("勾选后勾选框没有变成已完成态")
+            if Store(ui_path).state_of([i for i in Store(ui_path).items
+                                        if i["id"] == first["id"]][0]) != STATE_DONE:
+                problems.append("勾选状态没有落盘")
+            app.toggle_item(first["id"])
+
+            # 勾选圆是 cairo 自绘的（GTK 主题不管它）：抗锯齿必须真的混出
+            # 过渡像素，否则就是 1-bit 硬边。v0.4.0 初版把 ANTIALIAS 写成
+            # 1=NONE，圆又变毛了 —— 这里渲染一颗 18px 圆直接数颜色。
+            a11y_check = app.rows.get(first["id"]).check
+            if tr("完成状态", "Status") not in (a11y_check.get_accessible().get_name() or ""):
+                problems.append("勾选圆没有无障碍名称: %r"
+                                % (a11y_check.get_accessible().get_name(),))
+            if not (app.rows.get(first["id"]).get_accessible().get_name()
+                    or "").startswith(tr("待办：", "To-do: ")):
+                problems.append("条目行没有无障碍名称: %r"
+                                % (app.rows.get(first["id"]).get_accessible().get_name(),))
+            if cairo is not None:
+                ring = app.rows.get(first["id"]).check
+                ring_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 18, 18)
+                ring_context = cairo.Context(ring_surface)
+                ring_context.set_source_rgba(0, 0, 0, 1)
+                ring_context.paint()
+                ring._draw(None, ring_context)
+                ring_surface.flush()
+                ring_data = ring_surface.get_data()
+                ring_stride = ring_surface.get_stride()
+                ring_tones = set()
+                for y in range(18):
+                    for x in range(18):
+                        start = y * ring_stride + x * 4
+                        ring_tones.add(bytes(ring_data[start:start + 3]))
+                if len(ring_tones) < 5:
+                    problems.append("勾选圆没有抗锯齿（只有 %d 种颜色）"
+                                    % len(ring_tones))
+
+            # 等待中：整行琥珀色 + 状态落盘
+            app.toggle_waiting_item(second["id"])
+            if ui_store.state_of(app.find_item(second["id"])) != STATE_WAITING:
+                problems.append("「等待中」没有生效")
+            waiting_row = app.rows.get(second["id"])
+            if not waiting_row.title.get_style_context().has_class("waiting"):
+                problems.append("等待中的行没有等待态样式")
+            app.toggle_waiting_item(second["id"])
+
+            # 优先级：改高之后插到本段最前
+            app.set_priority_item(third["id"], PRIORITY_HIGH)
+            if ui_store.priority_of(app.find_item(third["id"])) != PRIORITY_HIGH:
+                problems.append("优先级没有设成高")
+            if ui_store.items[0]["id"] != third["id"]:
+                problems.append("高优先级没有浮到本段最前")
+
+            # 今天：徽标 + 组内靠前
+            app.toggle_today_item(third["id"])
+            if not app.find_item(third["id"]).get("today"):
+                problems.append("「今天要办的」没有生效")
+
+            # 筛选 chip
+            app.set_filter("工作")
+            if len(app.row_widgets) != 1:
+                problems.append("标签筛选后行数不对: %r" % (len(app.row_widgets),))
+            app.set_filter("不存在的标签")
+            if app.row_widgets:
+                problems.append("筛选无匹配时不该有行")
+            app.set_filter(None)
+            if len(app.row_widgets) != 3:
+                problems.append("切回「全部」后行数不对")
+
+            # 行内改名
+            app.begin_edit(first["id"])
+            edit_row = app.rows.get(first["id"])
+            if edit_row is None or edit_row._edit_entry is None:
+                problems.append("双击改名没有打开输入框")
             else:
-                widget._edit_entry.delete(0, "end")
-                widget._edit_entry.insert(0, "界面改名测试")
-                widget._end_edit(save=True)
-                edited = widget._find_item(target["id"])
-                if edited is None or edited["text"] != "界面改名测试":
-                    problems.append("界面改名没有生效")
-            # 删除 + 撤销：要放回原位置
-            order_before = [item["text"] for item in broken.items]
-            victim = broken.items[0]
-            widget.remove_item(victim["id"])
-            if widget._undo is None or any(item["id"] == victim["id"]
-                                           for item in broken.items):
-                problems.append("删除后没有留下撤销记录")
-            widget.undo_delete()
-            if [item["text"] for item in broken.items] != order_before:
-                problems.append("撤销删除后内容或顺序不一致")
-            widget._refresh()
-            # 「等待中」：格子已删，改从右键菜单切；切完那一行必须原地重画成琥珀字
-            row_wait = widget._row_widget(target["id"])
+                edit_row._edit_entry.set_text("  改过的文字  ")
+                app.end_edit(save=True)
+                if app.find_item(first["id"])["text"] != "改过的文字":
+                    problems.append("行内改名没有保存/去空白")
 
-            def menu_label(menu_now, index):
-                """取菜单项标签；分隔线没有 -label 选项，返回空串。"""
-                try:
-                    return str(menu_now.entrycget(index, "label"))
-                except tk.TclError:
-                    return ""
-
-            def menu_find(menu_now, needle):
-                if menu_now is None:
-                    return None
-                for index in range(menu_now.index("end") + 1):
-                    if needle in menu_label(menu_now, index):
-                        return index
-                return None
-
-            def wait_menu_item(item_id):
-                menu_now = widget._build_row_menu(item_id)
-                return menu_now, menu_find(menu_now, "等待中")
-
-            menu, wait_index = wait_menu_item(target["id"])
-            if wait_index is None:
-                problems.append("右键菜单里没有「等待中」这一项")
+            # 子步骤：保存、勾选
+            ui_store.set_steps(first["id"], [{"text": "步骤甲", "done": False},
+                                             {"text": "步骤乙", "done": True}])
+            app.render(keep_scroll=False)
+            app.begin_steps_edit(first["id"])
+            steps_row = app.rows.get(first["id"])
+            if steps_row is None or not steps_row._steps_editor:
+                problems.append("子步骤编辑器没有打开")
             else:
-                menu.invoke(wait_index)
-                if widget.store.state_of(target) != STATE_WAITING:
-                    problems.append("从菜单标记「等待中」没有生效")
-                if widget._row_widget(target["id"]) is not row_wait:
-                    problems.append("标记等待中时行控件被重建了（双击会因此失效）")
-                if target["done"]:
-                    problems.append("等待中不该同时是已完成")
-                fills = {str(row_wait.itemcget(i, "fill"))
-                         for i in row_wait.find_withtag("text")}
-                if fills != {C_WAIT}:
-                    problems.append("等待中的那一行正文没有变成琥珀色: %r" % (fills,))
-                menu, wait_index = wait_menu_item(target["id"])
-                if wait_index is not None:
-                    menu.invoke(wait_index)
-                if widget.store.state_of(target) != STATE_TODO:
-                    problems.append("从菜单再点一次「等待中」没有回到未完成")
-                if Store(path).state_of(
-                        [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
-                    problems.append("等待状态没有落盘")
+                entries = steps_row._steps_editor["entries"]
+                entries[0]._entry.set_text("步骤甲改")
+                app.end_steps_edit(save=True)
+                saved = ui_store.steps_of(app.find_item(first["id"]))
+                if [step["text"] for step in saved] != ["步骤甲改", "步骤乙"]:
+                    problems.append("子步骤保存结果不对: %r"
+                                    % ([step["text"] for step in saved],))
+                if not saved[1]["done"]:
+                    problems.append("子步骤的 done 没有按位置保留")
+            app.toggle_step_item(first["id"], 0)
+            if not ui_store.steps_of(app.find_item(first["id"]))[0]["done"]:
+                problems.append("点小方框没有勾上子步骤")
 
-            # ---- 子步骤：渲染 + 小方框勾选 + 步骤行保护 + 右键编辑器 ----
-            step_item = widget.store.add("带三个子步骤的界面自检条")
-            widget.store.set_steps(step_item["id"], ["步骤甲", "步骤乙", "步骤丙"])
-            widget._refresh()
-            row_steps = widget._row_widget(step_item["id"])
-            boxes = getattr(row_steps, "_step_boxes", None) or []
-            if len(boxes) != 3:
-                problems.append("子步骤没画出三行小方框: %r" % (boxes,))
+            # 删除 + 撤销
+            before_count = len(ui_store.items)
+            app.remove_item(second["id"])
+            if len(ui_store.items) != before_count - 1:
+                problems.append("删除没有生效")
+            if not app.undo_btn.get_visible():
+                problems.append("删除后没有出现「撤销删除」")
+            app.undo_delete()
+            if len(ui_store.items) != before_count:
+                problems.append("撤销删除没有把条目放回去")
+
+            # 已完成组折叠
+            done_item = ui_store.add("界面自检已完成")
+            ui_store.toggle(done_item["id"])
+            app.render(keep_scroll=False)
+            shown = len(app.row_widgets)
+            app.toggle_done_collapsed()
+            if len(app.row_widgets) >= shown:
+                problems.append("折叠已完成组后行数没变少")
+            app.toggle_done_collapsed()
+
+            # 到点提醒：横幅出现 + 清掉提醒（只响一次）+ 「知道了」收起
+            remind_item = ui_store.add("界面自检提醒")
+            ui_store.set_reminder(remind_item["id"], time.time() - 1)
+            app._remind_tick(raise_it=False)
+            if "⏰" not in app.hint.get_text():
+                problems.append("到点后没有弹出提醒横幅: %r" % (app.hint.get_text(),))
+            if not app.alert_btn.get_visible():
+                problems.append("到点后没有显示「知道了」")
+            if ui_store.due_reminders():
+                problems.append("到点提醒没有被清掉，会重复响")
+            app.dismiss_alert()
+            if app.alert_btn.get_visible():
+                problems.append("点「知道了」后横幅没有收起")
+
+            # 折叠 / 展开
+            app.toggle_collapsed()
+            if app.input_row.get_visible():
+                problems.append("折叠之后输入条还占着位置")
+            if not app.header.get_style_context().has_class("compact"):
+                problems.append("折叠之后 header 没有切到单行样式")
+            if app.header_left.get_visible():
+                problems.append("折叠之后两行标题还占着位置")
+            app.toggle_collapsed()
+            if not app.input_row.get_visible():
+                problems.append("展开之后输入条没有回来")
+            if app.header.get_style_context().has_class("compact"):
+                problems.append("展开之后 header 还是单行样式")
+
+            # 折叠尺寸：主检查窗口不显示、量不到字体，单独开一个离屏窗口量
+            off = Gtk.OffscreenWindow()
+            off_store = Store(os.path.join(temp_dir, "collapsed.json"))
+            off_store.add("折叠自检一")
+            off_app = TodoWindow(off, off_store, visible=False)
+            off_app.render(keep_scroll=False)
+            off.show_all()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            expanded_w = off_app.panel_w
+            off_app.toggle_collapsed()
+            compact_w, compact_h = off_app._collapsed_size()
+            if not (120 <= compact_w < PANEL_W_MIN):
+                problems.append("折叠态宽度没有收成内容宽: %r" % (compact_w,))
+            if not (24 <= compact_h <= 44):
+                problems.append("折叠态高度不对（应在 24~44）: %r" % (compact_h,))
+            if off_app._geometry_pending != (compact_w, compact_h):
+                problems.append("折叠尺寸没落到 resize 目标上: %r"
+                                % (off_app._geometry_pending,))
+            if tr("项未完成", "unfinished") not in off_app.compact_count.get_text():
+                problems.append("折叠态计数没有同步: %r"
+                                % off_app.compact_count.get_text())
+            off_app.toggle_collapsed()
+            if off_app._geometry_pending[0] != expanded_w:
+                problems.append("展开没有恢复原来的宽度: %r/%r"
+                                % (off_app._geometry_pending[0], expanded_w))
+            off.destroy()
+
+            # 归档浏览器：恢复一条
+            app.clear_done()
+            app.render(keep_scroll=False)
+            before_items = len(ui_store.items)
+            archive = ArchiveWindow(app)
+            if not ui_store.archive:
+                problems.append("清空已完成没有进归档")
             else:
-                box_h_before = int(row_steps.cget("height"))
+                archive._restore(ui_store.archive[-1])
+                if len(ui_store.items) != before_items + 1:
+                    problems.append("从归档恢复后条目数不对")
+            archive.win.destroy()
 
-                def steps_cell(row_now):
-                    items = (getattr(row_now, "_markers", None) or {}).get("steps") or ()
-                    return items[0][0] if items else None
+            # 底部提示优先级
+            app.set_filter("工作")
+            if tr("只看", "Only") not in app.hint.get_text():
+                problems.append("筛选状态下底部提示不对: %r" % (app.hint.get_text(),))
+            app.set_filter(None)
 
-                cell = steps_cell(row_steps)
-                if cell is None or str(row_steps.itemcget(cell, "text")) != "0/3":
-                    problems.append("子步骤格子上没有显示 0/3: %r"
-                                    % (row_steps.itemcget(cell, "text") if cell else None,))
-                index, y0, y1, x0, x1 = boxes[1]          # 勾第二个
-                cx = (x0 + x1) // 2
-                cy = (y0 + y1) // 2
-                widget._row_press(_StubEvent(x=cx, y=cy), step_item["id"])
-                widget._row_release(_StubEvent(x=cx, y=cy))
-                steps_now = widget.store.steps_of(step_item)
-                if [s["done"] for s in steps_now] != [False, True, False]:
-                    problems.append("点小方框没有勾上第二个子步骤: %r" % (steps_now,))
-                if widget._row_widget(step_item["id"]) is not row_steps:
-                    problems.append("勾子步骤时行控件被重建了（双击会因此失效）")
-                if widget.store.state_of(step_item) == STATE_DONE:
-                    problems.append("勾子步骤不该把主条目标成已完成")
-                if int(row_steps.cget("height")) != box_h_before:
-                    problems.append("勾子步骤不该改变行高")
-                cell = steps_cell(row_steps)
-                if cell is None or str(row_steps.itemcget(cell, "text")) != "1/3":
-                    problems.append("勾完一个后格子上应是 1/3: %r"
-                                    % (row_steps.itemcget(cell, "text") if cell else None,))
-                # 点步骤文字（不是小方框）：打开子步骤编辑，焦点落在点的那一条
-                step_text_x = widget.text_x + widget.step_indent + 12
-                widget._row_press(_StubEvent(x=step_text_x, y=cy), step_item["id"])
-                widget._row_release(_StubEvent(x=step_text_x, y=cy))
-                if [s["done"] for s in widget.store.steps_of(step_item)] != [False, True, False]:
-                    problems.append("点子步骤文字不该改动勾选")
-                if widget.store.state_of(step_item) == STATE_DONE:
-                    problems.append("点子步骤文字不该把主条目标成已完成")
-                if widget._steps_edit is None:
-                    problems.append("点子步骤文字应当打开子步骤编辑器（点了没反应＝编不了）")
-                else:
-                    if widget._steps_edit_focus_index() != 1:
-                        problems.append("点第 2 条子步骤文字时，焦点应当在第 2 个输入框: %r"
-                                        % (widget._steps_edit_focus_index(),))
-                    if len(widget._steps_edit[0]) != 3:
-                        problems.append("编辑器应当一条子步骤一个输入框，实际 %d 个: %r"
-                                        % (len(widget._steps_edit[0]),
-                                           widget._steps_edit[0]))
-                    if row_steps.find_withtag("step"):
-                        problems.append("编辑器开着时旧排版画的子步骤没撤掉（会重影）")
-                    widget._end_steps_edit(save=False)     # 收掉，别影响后面的用例
-                # 双击落在子步骤那一行 → 进子步骤编辑（不是主文字编辑、也不是没反应）
-                widget._begin_edit(step_item["id"], _StubEvent(x=step_text_x, y=cy))
-                if widget._edit_entry is not None:
-                    problems.append("双击子步骤那一行不该打开主文字编辑框")
-                if widget._steps_edit is None:
-                    problems.append("双击子步骤那一行应当打开子步骤编辑器（否则双击没反应）")
-                else:
-                    if widget._steps_edit_focus_index() != 1:
-                        problems.append("双击第 2 条子步骤时，焦点应当在第 2 个输入框: %r"
-                                        % (widget._steps_edit_focus_index(),))
-                    widget._end_steps_edit(save=False)     # 收掉，别影响后面的用例
-                # 右键条目的绑定必须在（子步骤编辑器的入口）
-                fresh_row = widget._row_widget(step_item["id"])   # 上面收编辑器时重画过，旧引用已销毁
-                if fresh_row is None or not fresh_row.bind("<Button-3>"):
-                    problems.append("条目没有绑定右键菜单，子步骤编辑器就没有入口")
-            # 编辑器：一条子步骤一个独立输入框；加一步 / 勾选 / 保存 / Esc 取消
-            widget._begin_steps_edit(step_item["id"])
-            record = widget._steps_edit
-            if not record or not record[0]:
-                problems.append("没有打开子步骤编辑器")
-            else:
-                edit_boxes = record[0]
+            # 搜索：过滤 → 关闭恢复
+            before_visible = len(app._visible_items())
+            sample = app.store.items[0]["text"]
+            app.toggle_search(True)
+            app.search_entry.set_text(sample)
+            if len(app._visible_items()) > before_visible:
+                problems.append("搜索没有过滤条目")
+            if not app.search_row.get_visible():
+                problems.append("搜索框没有显示")
+            app.toggle_search(False)
+            if len(app._visible_items()) != before_visible:
+                problems.append("关闭搜索后条目没有恢复")
 
-                def edit_texts():
-                    return [b.get("1.0", "end-1c") for b in widget._steps_edit[0]]
+            # 尺寸：宽度守下限 360、允许拉宽；内容列始终 ≤ 520（Clamp）
+            app._apply_user_size(200, 600)
+            if app.panel_w != PANEL_W_MIN:
+                problems.append("窗口宽度没有守住下限 360: %r" % (app.panel_w,))
+            app._apply_user_size(900, 600)
+            if app.panel_w != 900:
+                problems.append("窗口应当允许拉宽到 900: %r" % (app.panel_w,))
+            if app.clamp.max_width != PANEL_W_MAX:
+                problems.append("内容列限宽不是 520: %r" % (app.clamp.max_width,))
 
-                def box_tag_has_done(idx):
-                    try:
-                        return "done" in widget._steps_edit[0][idx].tag_names("1.0")
-                    except (tk.TclError, IndexError, TypeError):
-                        return False
-
-                if len(edit_boxes) != 3:
-                    problems.append("编辑器应当有 3 个独立输入框，实际 %d" % (len(edit_boxes),))
-                if edit_texts() != ["步骤甲", "步骤乙", "步骤丙"]:
-                    problems.append("编辑器内容不对: %r" % (edit_texts(),))
-                if len(set(id(b) for b in edit_boxes)) != len(edit_boxes):
-                    problems.append("编辑器的输入框不是各自独立的控件")
-                geom = list(widget._steps_edit_geom)
-                if len(geom) != len(edit_boxes) or any(
-                        geom[i + 1][0] <= geom[i][0] + geom[i][1]
-                        for i in range(len(geom) - 1)):
-                    problems.append("子步骤输入框之间没有留出空隙（会连成一块）: %r" % (geom,))
-                if widget._redraw_row(step_item["id"]):
-                    problems.append("子步骤编辑器开着时不该重画那一行")
-                if "回车=保存" not in str(widget.hint.cget("text")):
-                    problems.append("子步骤编辑器开着时，底部应当写成「回车=保存」: %r"
-                                    % (widget.hint.cget("text"),))
-                src = open(__file__, encoding="utf-8").read()
-                # 要搜的串拼出来 —— 直接写字面量的话，检查自己的源码里就有一份，
-                # 于是"永远找得到"、反例抓不到（这个坑实测过：swapped 绑定仍报 SELFTEST OK）。
-                want_return = 'box.bind("<Return>", self.' + '_steps_save_key)'
-                want_ctrl = ('box.bind("<Control-Return>", lambda event, i=index: self.'
-                             + '_steps_add_key(i))')
-                if want_return not in src or want_ctrl not in src:
-                    problems.append("按键接线不对：回车要接 _steps_save_key、"
-                                    "Ctrl+回车要接 _steps_add_key")
-                count_before = len(edit_boxes)
-                widget._steps_add_key(0)                     # 等价于在第 1 条上按 Ctrl+回车
-                if widget._steps_edit is None:
-                    problems.append("Ctrl+回车 不该退出编辑（它的活是加一步）")
-                elif len(widget._steps_edit[0]) != count_before + 1:
-                    problems.append("Ctrl+回车 没有加出一个输入框: %d -> %d"
-                                    % (count_before, len(widget._steps_edit[0])))
-                elif widget._steps_edit_focus_index() != 1:
-                    problems.append("加一步之后焦点应当落在新框上: %r"
-                                    % (widget._steps_edit_focus_index(),))
-                # 编辑中点小方框：只改编辑中的勾选状态（保存时一起落盘）
-                widget._steps_edit_toggle(3)
-                if not box_tag_has_done(3):
-                    problems.append("编辑中点小方框后，那个输入框没有删除线")
-                widget._steps_edit_toggle(3)
-                boxes_now = widget._steps_edit[0]
-                boxes_now[0].delete("1.0", "end")
-                boxes_now[0].insert("1.0", "步骤甲改了")
-                boxes_now[1].delete("1.0", "end")            # 新加的空框：保存时应当丢掉
-                boxes_now[2].delete("1.0", "end")
-                boxes_now[2].insert("1.0", "步骤乙改了")
-                boxes_now[3].delete("1.0", "end")            # 删掉「步骤丙」
-                widget._steps_save_key()                     # 等价于按回车（保存退出）
-                steps_saved = widget.store.steps_of(step_item)
-                if [s["text"] for s in steps_saved] != ["步骤甲改了", "步骤乙改了"]:
-                    problems.append("保存的文本不对（空框应当丢掉）: %r" % (steps_saved,))
-                if [s["done"] for s in steps_saved] != [False, True]:
-                    problems.append("按位置保留勾选这条不对: %r" % (steps_saved,))
-                if widget._steps_edit is not None:
-                    problems.append("保存后编辑器引用没清掉")
-                if "回车=保存" in str(widget.hint.cget("text")):
-                    problems.append("编辑器收掉后，底部提示应当恢复: %r"
-                                    % (widget.hint.cget("text"),))
-            # 子步骤编辑中：点别的条目退出编辑；点自己的框 / 小方框区不算
-            widget._begin_steps_edit(step_item["id"])
-            if widget._steps_edit is None:
-                problems.append("点别处退出编辑的用例打不开子步骤编辑器")
-            else:
-                first_box = widget._steps_edit[0][0]
-                hit_box = _StubEvent(x=5, y=5)
-                hit_box.widget = first_box
-                widget._on_global_click(hit_box)
-                if widget._steps_edit is None:
-                    problems.append("点子步骤输入框自己不该退出编辑")
-                edit_row = widget._row_widget(step_item["id"])
-                hit_steps = _StubEvent(x=widget.text_x + 2, y=int(edit_row._step_top) + 2)
-                hit_steps.widget = edit_row
-                widget._on_global_click(hit_steps)
-                if widget._steps_edit is None:
-                    problems.append("点子步骤小方框/空隙不该退出编辑（勾选会被吞掉）")
-                hit_title = _StubEvent(x=widget.text_x + 2, y=widget.row_pad_y)
-                hit_title.widget = edit_row
-                widget._on_global_click(hit_title)
-                if widget._steps_edit is not None:
-                    problems.append("点这一行的标题区应当退出子步骤编辑")
-            widget._begin_steps_edit(step_item["id"])
-            if widget._steps_edit is None:
-                problems.append("第二次打开子步骤编辑器失败")
-            else:
-                other_row = None
-                for row_id, row_widget in widget.row_widgets:
-                    if row_id != step_item["id"]:
-                        other_row = row_widget
-                        break
-                other_id = None
-                if other_row is not None:
-                    for row_id, row_widget in widget.row_widgets:
-                        if row_widget is other_row:
-                            other_id = row_id
-                            break
-                if other_row is None:
-                    problems.append("子步骤编辑退出用例找不到另一行")
-                else:
-                    outside = _StubEvent(x=5, y=5)
-                    outside.widget = other_row
-                    widget._on_global_click(outside)
-                    if widget._steps_edit is not None:
-                        problems.append("点其他条目没有退出子步骤编辑状态")
-                    if widget._row_widget(other_id) is not other_row:
-                        problems.append("退出子步骤编辑时把别的行也重建了"
-                                        "（紧接着的双击会接不上）")
-                widget._end_steps_edit(save=False)
-            widget._begin_steps_edit(step_item["id"])
-            esc_boxes = (widget._steps_edit or ([], None))[0]
-            if esc_boxes:
-                esc_boxes[0].delete("1.0", "end")
-                esc_boxes[0].insert("1.0", "不该被保存")
-                widget._end_steps_edit(save=False)
-                if [s["text"] for s in widget.store.steps_of(step_item)] != \
-                        ["步骤甲改了", "步骤乙改了"]:
-                    problems.append("Esc 取消不该改动子步骤")
-            else:
-                problems.append("第二次打开子步骤编辑器失败")
-            # 回车＝保存（真按键）：改一条再按回车，编辑器收掉且改动落盘
-            widget._begin_steps_edit(step_item["id"])
-            enter_boxes = (widget._steps_edit or ([], None))[0]
-            if not enter_boxes:
-                problems.append("回车用例打不开子步骤编辑器")
-            else:
-                enter_boxes[0].delete("1.0", "end")
-                enter_boxes[0].insert("1.0", "回车保存的第一行")
-                if len(enter_boxes) > 1:
-                    enter_boxes[1].delete("1.0", "end")
-                    enter_boxes[1].insert("1.0", "回车保存的第二行")
-                widget._steps_save_key()                    # 等价于按回车
-                if widget._steps_edit is not None:
-                    problems.append("子步骤编辑器里按回车应当保存并退出")
-                saved_now = [s["text"] for s in widget.store.steps_of(step_item)]
-                if saved_now != ["回车保存的第一行", "回车保存的第二行"]:
-                    problems.append("按回车保存的内容不对: %r" % (saved_now,))
-            # 双击改标题：输入框只盖标题那一块，子步骤继续露着
-            title_row = widget._row_widget(step_item["id"])
-            if title_row is not None:
-                step_top = int(getattr(title_row, "_step_top", 0))
-                main_h = int(getattr(title_row, "_main_h", 0) or 0)
-                widget._begin_edit(step_item["id"])
-                title_entry = widget._edit_entry
-                if title_entry is None:
-                    problems.append("双击改标题没有打开输入框")
-                else:
-                    place = title_entry.place_info()
-                    if int(place["y"]) != widget.row_pad_y:
-                        problems.append("改标题的输入框没有从标题行开始: y=%r"
-                                        % (place["y"],))
-                    if int(place["height"]) != max(widget.px(16), main_h):
-                        problems.append("改标题的输入框高度不对: %r（期望 %r）"
-                                        % (place["height"], max(widget.px(16), main_h)))
-                    if step_top and int(place["y"]) + int(place["height"]) > step_top:
-                        problems.append("改标题的输入框盖住子步骤了: %r + %r > %r"
-                                        % (place["y"], place["height"], step_top))
-                    # 打开编辑器的那一次按下（双击的第二下）不能被"点别处"逻辑关掉
-                    widget._end_edit(save=False)
-                    same_click = _StubEvent(x=widget.text_x + 2,
-                                            y=widget.row_pad_y + 2)
-                    same_click.serial = 424242
-                    widget._begin_edit(step_item["id"], same_click)
-                    if widget._edit_entry is None:
-                        problems.append("带 serial 的事件没能打开标题编辑框")
-                    widget._on_global_click(same_click)
-                    if widget._edit_entry is None:
-                        problems.append("同一次双击事件里的全局点击把刚打开的编辑器关掉了")
-                    widget._end_edit(save=False)
-                    widget._begin_edit(step_item["id"])
-                    title_entry = widget._edit_entry
-                    # 点编辑框自己不算"点到别处"
-                    inside = _StubEvent(x=widget.text_x + 4, y=widget.row_pad_y + 4)
-                    inside.widget = title_entry
-                    widget._on_global_click(inside)
-                    if widget._edit_entry is None:
-                        problems.append("点在标题编辑框自己身上不该结束编辑")
-                    # 点别的条目 = 结束编辑（保存）
-                    other_row, other_id = None, None
-                    for row_id, row_widget in widget.row_widgets:
-                        if row_id != step_item["id"]:
-                            other_row, other_id = row_widget, row_id
-                            break
-                    if other_row is None:
-                        problems.append("点别处退出编辑的用例找不到另一行")
-                    else:
-                        outside = _StubEvent(x=widget.text_x + 2, y=widget.row_pad_y + 2)
-                        outside.widget = other_row
-                        widget._on_global_click(outside)
-                        if widget._edit_entry is not None:
-                            problems.append("点其他条目没有退出标题编辑状态")
-                        if widget._row_widget(other_id) is not other_row:
-                            problems.append("点其他条目退出编辑时把那一行也重建了"
-                                            "（紧接着的双击会接不上）")
-                        # 退出编辑的那一下只该"退出"，松手不能顺手把别的条目勾成完成
-                        widget._begin_edit(step_item["id"])
-                        widget._press = {"id": other_id, "y": 0, "zone": "body",
-                                         "step": None}
-                        widget._on_global_click(outside)
-                        if widget._press is not None:
-                            problems.append("退出编辑的那一下没被吞掉"
-                                            "（松手会顺手勾选别的条目）")
-                    widget._end_edit(save=False)
-
-            # 小键盘回车 / 点别处收菜单 / 右键加子步骤
-            src2 = open(__file__, encoding="utf-8").read()
-            kp_steps = 'box.bind("<KP_Enter>", self.' + '_steps_save_key)'
-            if kp_steps not in src2:
-                problems.append("子步骤框的小键盘回车没接上")
-            if not widget.entry.bind("<KP_Enter>"):
-                problems.append("顶部「添加待办」输入框没有接小键盘回车（按了没反应）")
-            src3 = open(__file__, encoding="utf-8").read()
-            if not widget.root.bind_all("<Button-1>"):
-                problems.append("没有装「点别处收起右键菜单」的全局绑定")
-            # 拼串查，免得检查自己的字面量把自己喂饱（这个坑栽过一次）
-            bad_global = 'bind_all("<Button-' + '3>"'
-            if bad_global in src3:
-                problems.append("不许全局绑 <Button-3>：右键那一下会把刚弹出的菜单立刻收掉")
-            probe_menu = widget._build_row_menu(step_item["id"])
-            widget._row_menu = probe_menu
-            blank = _StubEvent(x=0)
-            blank.widget = widget.inner                 # 模拟"点在空白处"
-            widget._dismiss_row_menu(blank)
-            if widget._row_menu is not None:
-                problems.append("点空白处没有收起右键菜单（引用没清）")
-            elif probe_menu.winfo_exists():
-                problems.append("收起右键菜单后控件没销毁（会越堆越多）")
-            probe_menu2 = widget._build_row_menu(step_item["id"])
-            widget._row_menu = probe_menu2
-            inside = _StubEvent(x=0)
-            inside.widget = probe_menu2                 # 模拟"点在菜单自己身上"
-            widget._dismiss_row_menu(inside)
-            if widget._row_menu is None or not probe_menu2.winfo_exists():
-                problems.append("点在菜单自己身上不该把它销毁（否则菜单项点不动）")
-            widget._dismiss_row_menu()                  # 清干净
-            if widget._row_menu is not None:
-                problems.append("收起菜单后引用没清掉")
-            steps_before_add = len(widget.store.steps_of(step_item))
-            widget.add_step_item(step_item["id"])
-            if len(widget.store.steps_of(step_item)) != steps_before_add + 1:
-                problems.append("「＋ 加一条子步骤」没有加出一条")
-            widget.store.set_steps(step_item["id"],
-                                   [{"text": "步骤%d" % i, "done": False}
-                                    for i in range(STEP_MAX)])
-            widget.add_step_item(step_item["id"])
-            if len(widget.store.steps_of(step_item)) != STEP_MAX:
-                problems.append("加子步骤也要受 %d 条上限约束" % STEP_MAX)
-
-            # 全勾上（显式设成完成，别用 toggle —— 有的本来就是勾着的）：进度变强调色
-            widget.store.set_steps(step_item["id"],
-                                   [{"text": st["text"], "done": True}
-                                    for st in widget.store.steps_of(step_item)])
-            widget._refresh()
-            row_all = widget._row_widget(step_item["id"])
-            cell_all = steps_cell(row_all)
-            if cell_all is None or str(row_all.itemcget(cell_all, "fill")) != C_ACCENT:
-                problems.append("子步骤全完成时格子应是强调色（text=%r fill=%r 进度=%r）"
-                                % (row_all.itemcget(cell_all, "text") if cell_all else None,
-                                   row_all.itemcget(cell_all, "fill") if cell_all else None,
-                                   widget.store.steps_progress(step_item)))
-            # 收尾：删掉这条测试条目，后面用例面对的还是原来的列表
-            widget.store.pop(step_item["id"])
-            widget._refresh()
-
-            # ---- 右侧图标区只许有「子步骤」与「删除」（钟/今/旗已删）----
-            mark_item = broken.items[0]
-            row_mark = widget._row_widget(mark_item["id"])
-            zones = set((getattr(row_mark, "_markers", None) or {}).keys())
-            if zones != {"delete", "steps"}:
-                problems.append("右侧图标区应当只有 子步骤+删除，实际画了: %r" % (zones,))
-            table = [name for name, _width in widget.markers]
-            if table != ["delete", "steps"]:
-                problems.append("尺寸表/点击判定里的格子应当只有 子步骤+删除，实际: %r"
-                                % (table,))
-            # 行为面：老格子所在的位置不该再被判成 wait/today/prio 区
-            probes = [widget.list_w - widget.del_w - widget.wait_w // 2,
-                      widget.list_w - widget.del_w - widget.wait_w - widget.today_w // 2,
-                      widget.list_w - widget.del_w - widget.wait_w - widget.today_w \
-                      - widget.prio_w // 2]
-            for probe_x in probes:
-                got_zone = widget._zone_at(probe_x)
-                if got_zone in ("wait", "today", "prio"):
-                    problems.append("x=%s 还被判成已删除的按钮区: %r" % (probe_x, got_zone))
-            # 优先级：菜单里选 → 行左侧竖条（高＝整行、中＝半行、无＝不画）
-            menu = widget._build_row_menu(mark_item["id"])
-            cascade = [i for i in range(menu.index("end") + 1)
-                       if "优先级" in menu_label(menu, i)]
-            if not cascade:
-                problems.append("右键菜单里没有「优先级」子菜单")
-            else:
-                sub = menu.nametowidget(menu.entrycget(cascade[0], "menu"))
-                sub.invoke(0)                                  # 第一项 ＝ 高
-                if widget.store.priority_of(mark_item) != PRIORITY_HIGH:
-                    problems.append("菜单里选「高」没有生效: %r"
-                                    % (widget.store.priority_of(mark_item),))
-                if widget._row_widget(mark_item["id"]) is not row_mark:
-                    problems.append("改优先级时行控件被重建了（双击会因此失效）")
-                bars = row_mark.find_withtag("prio")
-                row_h_now = int(row_mark.cget("height"))
-                if len(bars) != 1 or str(row_mark.itemcget(bars[0], "fill")) != C_HIGH:
-                    problems.append("高优先级应当在行左侧画一条实心橙竖条: %r" % (bars,))
-                elif row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] < row_h_now * 0.8:
-                    problems.append("高优先级的竖条应当是整行高: %r"
-                                    % (row_mark.bbox(bars[0]),))
-                sub.invoke(1)                                  # 中
-                if widget.store.priority_of(mark_item) != PRIORITY_MID:
-                    problems.append("菜单里选「中」没有生效")
-                bars = row_mark.find_withtag("prio")
-                if len(bars) != 1:
-                    problems.append("中优先级也该有一条竖条: %r" % (bars,))
-                else:
-                    if row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] > row_h_now * 0.7:
-                        problems.append("中优先级的竖条应当只有半行高: %r"
-                                        % (row_mark.bbox(bars[0]),))
-                    mid_fill = str(row_mark.itemcget(bars[0], "fill"))
-                    if mid_fill == C_HIGH:
-                        problems.append("中优先级和高优先级颜色一样，看不出区别")
-                    elif mid_fill != C_MID:
-                        problems.append("中优先级竖条颜色不对: %r（期望 %r）"
-                                        % (mid_fill, C_MID))
-                sub.invoke(2)                                  # 无
-                if widget.store.priority_of(mark_item) != PRIORITY_NONE \
-                        or row_mark.find_withtag("prio"):
-                    problems.append("选「无」之后竖条应当消失")
-            # 今天：菜单里标记 → 正文前一个蓝点；底部显示今天进度
-            menu = widget._build_row_menu(mark_item["id"])
-
-            today_index = menu_find(menu, "今天")
-            if today_index is None:
-                problems.append("右键菜单里没有「今天要办的」")
-            else:
-                menu.invoke(today_index)
-                if not mark_item.get("today"):
-                    problems.append("从菜单标记「今天要办的」没有生效")
-                dots = row_mark.find_withtag("today")
-                if len(dots) != 1 or str(row_mark.itemcget(dots[0], "fill")) != C_ACCENT:
-                    problems.append("今天的条目前面应当有一个蓝点: %r" % (dots,))
-                if "今天" not in str(widget.hint.cget("text")):
-                    problems.append("底部没有显示今天进度: %r" % (widget.hint.cget("text"),))
-                menu = widget._build_row_menu(mark_item["id"])
-                today_index = menu_find(menu, "今天")
-                if today_index is not None:
-                    menu.invoke(today_index)
-                if mark_item.get("today"):
-                    problems.append("再从菜单点一次「今天要办的」应取消标记")
-            # A 方案：UI 改「今天」也要把那条浮到本段最前（不能只改数据不挪位置）
-            todo_probe = None
-            for entry in reversed(widget.store.items):
-                if widget.store.state_of(entry) == STATE_TODO and not entry.get("today"):
-                    todo_probe = entry
-                    break
-            if todo_probe is None:
-                problems.append("A 方案用例找不到可标今天的条目")
-            else:
-                widget.toggle_today_item(todo_probe["id"])
-                todo_ids = [row_id for row_id, _ in widget.row_widgets
-                            if widget.store.state_of(widget._find_item(row_id)) == STATE_TODO]
-                if not todo_ids or todo_ids[0] != todo_probe["id"]:
-                    problems.append("标「今天」后那条没有浮到本段最前（改今天没插组）")
-                widget.toggle_today_item(todo_probe["id"])      # 还原
-                widget._refresh()
-            # 提醒：行尾出现 ⏰ 时间、标题栏计数、取消后消失
-            row_mark = widget._row_widget(mark_item["id"])
-            if row_mark.find_withtag("remind"):
-                problems.append("没设提醒的条目行尾不该有 ⏰")
-            widget.set_reminder_item(mark_item["id"], time.time() + 3600)
-            row_mark = widget._row_widget(mark_item["id"])
-            remind_items = row_mark.find_withtag("remind")
-            if len(remind_items) != 1:
-                problems.append("设了提醒之后，条目行尾没有显示 ⏰ 时间: %r"
-                                % (remind_items,))
-            elif "⏰" not in str(row_mark.itemcget(remind_items[0], "text")):
-                problems.append("行尾提醒文字不对: %r"
-                                % (row_mark.itemcget(remind_items[0], "text"),))
-            if "提醒" not in str(widget.count.cget("text")):
-                problems.append("标题栏没有显示提醒数: %r"
-                                % (widget.count.cget("text"),))
-            widget.clear_reminder_item(mark_item["id"])
-            row_mark = widget._row_widget(mark_item["id"])
-            if row_mark.find_withtag("remind"):
-                problems.append("取消提醒后行尾 ⏰ 时间没有消失")
-            # 菜单里该有的动作都在（删除不真的点，免得弹出撤销条影响后面的提示断言）
-            menu = widget._build_row_menu(mark_item["id"])
-            labels = " ".join(menu_label(menu, i)
-                              for i in range(menu.index("end") + 1))
-            for wanted in ("等待中", "今天要办的", "优先级", "编辑子步骤",
-                           "＋ 加一条子步骤", "删除这条"):
-                if wanted not in labels:
-                    problems.append("右键菜单缺少「%s」: %r" % (wanted, labels))
-            probe = {"id": -1, "text": "x", "done": False, "state": STATE_TODO,
-                     "priority": PRIORITY_NONE, "today": False}
-            if widget._bucket_of(probe) == widget._bucket_of(dict(probe, priority=PRIORITY_HIGH)):
-                problems.append("优先级没有参与排序桶")
-            if widget._bucket_of(probe) == widget._bucket_of(dict(probe, today=True)):
-                problems.append("「今天」没有参与排序桶")
-
-            # ---- 情境标签：@ 解析 / 行尾显示 / 顶部筛选 ----
-            tg = Store(os.path.join(temp_dir, "tags.json"))
-            if Store.parse_tags("写周报") != ("写周报", []):
-                problems.append("没标签的文字不该被改动")
-            if Store.parse_tags("给张老师打电话 @电话 @外出") != ("给张老师打电话",
-                                                              ["电话", "外出"]):
-                problems.append("@ 解析不对: %r"
-                                % (Store.parse_tags("给张老师打电话 @电话 @外出"),))
-            t2_text, t2_tags = Store.parse_tags("@电话 交资料 @电话 @家 @单位 @超出的")
-            if t2_tags != ["电话", "家", "单位"] or "@超出的" not in t2_text:
-                problems.append("标签去重/上限不对: %r" % ((t2_text, t2_tags),))
-            t3_text, t3_tags = Store.parse_tags("邮箱@qq.com 和 a.com/x@y")
-            if t3_tags or "@qq.com" not in t3_text:
-                problems.append("邮箱/网址不该被当成标签: %r" % ((t3_text, t3_tags),))
-            ti = tg.add("整理会议纪要 @电话")
-            if ti["text"] != "整理会议纪要" or Store.tags_of(ti) != ["电话"]:
-                problems.append("add 没有把 @标签 摘进 tags: %r" % (ti,))
-            tg.rename(ti["id"], "整理会议纪要 @电话 @外出")
-            if Store.tags_of(ti) != ["电话", "外出"]:
-                problems.append("rename 没有更新标签: %r" % (Store.tags_of(ti),))
-            tg.rename(ti["id"], "整理会议纪要")
-            if Store.tags_of(ti) != []:
-                problems.append("删掉 @标签 后 tags 应当为空: %r" % (Store.tags_of(ti),))
-            tg.rename(ti["id"], "整理会议纪要 @电话")
-            tg.add("买菜 @外出")
-            if sorted(tg.all_tags()) != ["外出", "电话"]:
-                problems.append("all_tags 不对: %r" % (tg.all_tags(),))
-            reload_tags = Store(os.path.join(temp_dir, "tags.json"))
-            got_tags = sorted(tag for item in reload_tags.items
-                              for tag in Store.tags_of(item))
-            if got_tags != ["外出", "电话"]:
-                problems.append("标签没有落盘: %r" % (got_tags,))
-            # 界面：正文顶满一行时，行尾标签也不许压到右侧图标区
-            base_char = widget.fonts["base"].measure("长") or 1
-            long_text = "长" * max(4, int(widget.row_wrap // base_char))
-            tagged = widget.store.add(long_text + " @电话")
-            no_tag_item = widget.store.add("界面无标签条")
-            widget._refresh()
-            row_tag = widget._row_widget(tagged["id"])
-            tag_item = getattr(row_tag, "_tag_item", None)
-            if tag_item is None or str(row_tag.itemcget(tag_item, "text")) != "@电话":
-                problems.append("行尾没有画出 @电话 标签: %r" % (tag_item,))
-            elif row_tag.bbox(tag_item)[2] > widget._marker_zone_start():
-                problems.append("行尾标签压到了右侧图标区")
-            # 长正文 + 标签 + 提醒：行尾内容放不下时要换到下一行，不能压右侧按钮
-            widget.set_reminder_item(tagged["id"], time.time() + 3600)
-            row_tag = widget._row_widget(tagged["id"])
-            for tagname in ("tag", "remind"):
-                for item_id in row_tag.find_withtag(tagname):
-                    bbox = row_tag.bbox(item_id)
-                    if bbox and bbox[2] > widget._marker_zone_start():
-                        problems.append("行尾 %s 压到了右侧图标区: %r"
-                                        % (tagname, bbox))
-            widget.clear_reminder_item(tagged["id"])
-            if not widget.tags_row.winfo_children():
-                problems.append("有标签时顶部筛选条没有生成筛选项")
-            widget.set_filter("电话")
-            if [i["id"] for i in widget._visible_items()] != [tagged["id"]]:
-                problems.append("筛选后可见条目不对: %r"
-                                % ([i["text"][:6] for i in widget._visible_items()],))
-            if "只看 @电话" not in str(widget.hint.cget("text")):
-                problems.append("筛选时底部没有提示: %r" % (widget.hint.cget("text"),))
-            if widget.store.remaining(widget._visible_items()) != 1:
-                problems.append("筛选后的计数不对")
-            widget.set_filter(None)
-            if len(widget._visible_items()) != len(widget.store.items):
-                problems.append("取消筛选后应当看到全部")
-            widget._begin_edit(tagged["id"])
-            shown = widget._edit_entry.get() if widget._edit_entry is not None else ""
-            if "@电话" not in shown:
-                problems.append("编辑框没有回填 @电话: %r" % (shown,))
-            widget._end_edit(save=True)
-            if Store.tags_of(tagged) != ["电话"]:
-                problems.append("编辑保存后标签丢了: %r" % (Store.tags_of(tagged),))
-            for extra_id in (tagged["id"], no_tag_item["id"]):
-                widget.store.pop(extra_id)
-            widget._refresh()
-
-            # 唤回的最后一招：自己发 EWMH 的 _NET_ACTIVE_WINDOW（KWin 忽略后台应用的
-            # XRaiseWindow —— Super+D 之后按快捷键拉不回来，缺的就是这一条）。
-            # 放在 activate_window 之前真发一次：此刻自检窗口从没映射过、KWin 的客户列表里
-            # 没有它，所以这条消息会被忽略，桌面照旧不被打扰；但整段代码（atom、XEvent
-            # 结构体、XSendEvent 的签名、XFlush）都是真跑的 —— 写错了自检就会失败。
-            if not _on_wm_window(widget.root, _send_active_window):
-                problems.append("发不出 EWMH _NET_ACTIVE_WINDOW（Super+D 之后唤不回来就是这条断了）")
-
-            # 唤回总闸门：写日志 + 必要时强制重映射（真调一次，看日志里有没有前后状态）。
-            # notify_wm=False：上一条已经单独验过发送，这里不让它再打扰桌面一次。
-            activate_window(widget.root, False, notify_wm=False)
-            widget.root.withdraw()                    # 别把自检窗口真的弹出来
-            try:
-                with open(os.path.join(os.path.dirname(widget.store.path), "hotkey.log"),
-                          encoding="utf-8") as handle:
-                    log_text = handle.read()
-            except IOError:
-                log_text = ""
-            if "activate 前:" not in log_text:
-                problems.append("唤回函数没有写诊断日志（下次唤不回来还是没法定位）")
-            if "remap=" not in log_text:
-                problems.append("诊断日志里没有 remap 判定")
-            if "activate 后:" not in log_text and "activate 失败" not in log_text:
-                problems.append("唤回日志内容不对（既没有成功也没有失败记录）")
-
-            # 诊断日志：能真写出文件（下次"唤不回来"靠它定位）
-            write_diag("selftest-probe")
-            log_path = os.path.join(os.path.dirname(widget.store.path), "hotkey.log")
-            try:
-                with open(log_path, encoding="utf-8") as handle:
-                    if "selftest-probe" not in handle.read():
-                        problems.append("诊断日志没有真的写出来（下次没法定位唤回问题）")
-            except IOError:
-                problems.append("诊断日志文件不存在")
-
-            # ---- 归档：过 00:00 自动收走已完成的；删除进归档、可撤销 ----
-            arc_path = os.path.join(temp_dir, "archive.json")
-            arc = Store(arc_path)
-            midnight = Store.day_start()
-            old_done = arc.add("昨天就完成了的")
-            arc.toggle(old_done["id"])
-            old_done["done_at"] = midnight - 60           # 昨天 23:59 完成
-            today_done = arc.add("今天刚完成的")
-            arc.toggle(today_done["id"])
-            plain = arc.add("还没做的")
-            moved_count = arc.archive_completed()
-            if moved_count != 1:
-                problems.append("自动归档应当只收走昨天完成的那一条，实际 %r" % (moved_count,))
-            left_ids = [item["id"] for item in arc.items]
-            if old_done["id"] in left_ids or today_done["id"] not in left_ids \
-                    or plain["id"] not in left_ids:
-                problems.append("自动归档收错了: %r" % (left_ids,))
-            total, counts = arc.archive_stats()
-            if total != 1 or counts.get("done") != 1:
-                problems.append("归档统计不对: %r" % ((total, counts),))
-            reload_arc = Store(arc_path)
-            if len(reload_arc.archive) != 1 \
-                    or reload_arc.archive[0]["item"]["id"] != old_done["id"]:
-                problems.append("归档没有落盘")
-            if [item["id"] for item in reload_arc.items] != left_ids:
-                problems.append("归档后的活动列表没有落盘")
-            # 删除 → 进归档；撤销 → 从归档里拿回来
-            victim = arc.items[0]
-            record = arc.pop(victim["id"])
-            if record is None or arc.archive_stats()[0] != 2:
-                problems.append("删除没有把条目送进归档（数据会丢）")
-            if not arc.restore(record):
-                problems.append("撤销删除失败")
-            if arc.archive_stats()[0] != 1 or victim["id"] not in [i["id"] for i in arc.items]:
-                problems.append("撤销删除后归档里还留着那条")
-            # 「归档已完成」= 归档，不是真删
-            arc.clear_done()
-            total, counts = arc.archive_stats()
-            if counts.get("cleared") != 1:
-                problems.append("「归档已完成」没有按 cleared 记进归档: %r" % (counts,))
-            if any(item["state"] == STATE_DONE for item in arc.items):
-                problems.append("「归档已完成」没有把已完成的挪走")
-            for index in range(ARCHIVE_MAX + 20):
-                arc._archive_item({"id": 900000 + index, "text": "x", "done": True,
-                                   "state": STATE_DONE}, "done")
-            if len(arc.archive) != ARCHIVE_MAX:
-                problems.append("归档没有限制在 %d 条: %r" % (ARCHIVE_MAX, len(arc.archive)))
-            # done_at：勾选时记、取消时清；老数据读取时补
-            dat = Store(os.path.join(temp_dir, "done-at.json"))
-            dat_item = dat.add("看 done_at")
-            if dat_item.get("done_at") is not None:
-                problems.append("新条目的 done_at 应当是空的")
-            dat.toggle(dat_item["id"])
-            if not dat_item.get("done_at"):
-                problems.append("勾成已完成时没有记 done_at")
-            dat.toggle(dat_item["id"])
-            if dat_item.get("done_at") is not None:
-                problems.append("取消完成后没有清掉 done_at")
-            legacy_path = os.path.join(temp_dir, "legacy-done.json")
-            legacy = Store(legacy_path)
-            legacy.items.append({"id": 1, "text": "老数据已完成", "done": True,
-                                 "state": STATE_DONE, "priority": PRIORITY_NONE,
-                                 "today": False, "created": time.time()})
-            legacy.save()
-            if not Store(legacy_path).items[0].get("done_at"):
-                problems.append("老数据里已完成的条目读取时要补 done_at，否则一升级就被归档")
-            # 界面：定时器在跑；跨天那一眼真的把行收走；删除可撤销
-            if hasattr(widget, "_archive_job") or hasattr(widget, "_archive_timer_tick"):
-                problems.append("不该再有周期性的归档定时器（只在启动时看一次）")
-            if widget._archive_tick() != 0:
-                problems.append("同一天里再叫一次归档应当什么都不做（一天最多一次）")
-            widget.store.items.insert(0, {"id": 424242, "text": "昨天完成的界面条",
-                                          "steps": [], "done": True, "state": STATE_DONE,
-                                          "priority": PRIORITY_NONE, "today": False,
-                                          "done_at": Store.day_start() - 3600,
-                                          "created": time.time()})
-            widget._archived_day = None
-            moved_ui = widget._archive_tick()
-            if moved_ui != 1 or widget._row_widget(424242) is not None:
-                problems.append("跨天那一眼没有把已完成的行收走: %r" % (moved_ui,))
-            if not any(rec["item"]["id"] == 424242 for rec in widget.store.archive):
-                problems.append("界面归档的那条没有进 archive")
-            undo_victim = widget.store.items[0]
-            widget.remove_item(undo_victim["id"])
-            if widget._undo is None or "已删除" not in str(widget.hint.cget("text")):
-                problems.append("删掉之后没有出现撤销提示")
-            if str(widget.undo_btn.cget("text")) != "撤销删除":
-                problems.append("撤销按钮文案不对: %r" % (widget.undo_btn.cget("text"),))
-            widget.undo_delete()
-            if undo_victim["id"] not in [i["id"] for i in widget.store.items]:
-                problems.append("点撤销没有把删除的条目放回来")
-            if any(rec["item"]["id"] == undo_victim["id"] for rec in widget.store.archive):
-                problems.append("撤销之后归档里还留着那条")
-
-            # ---- 归档浏览器：右键标题栏 →「查看归档…」（只读列表 + 逐条恢复）----
-            saved_archive = list(widget.store.archive)
-            now_ts = time.time()
-
-            def _arch_record(item_id, text, reason, state, age):
-                return {"item": {"id": item_id, "text": text, "steps": [], "tags": [],
-                                 "done": state == STATE_DONE, "state": state,
-                                 "priority": PRIORITY_NONE, "today": False,
-                                 "done_at": None, "created": now_ts},
-                        "archived_at": now_ts - age, "reason": reason, "index": 0}
-
-            widget.store.archive = [
-                _arch_record(700001, "昨天完成的", "done", STATE_DONE, 300),
-                _arch_record(700002, "手动归档的", "cleared", STATE_DONE, 200),
-                _arch_record(700003, "删掉的那条", "deleted", STATE_TODO, 100),
-            ]
-            viewer = ArchiveWindow(widget, visible=False)
-            if len(viewer._rows) != 3:
-                problems.append("归档窗口没把 3 条归档都列出来: %r" % (len(viewer._rows),))
-            if viewer.win.winfo_ismapped():
-                problems.append("visible=False 的归档窗口不该被映射出来（会打扰桌面）")
-
-            def _all_labels(parent):
-                found = []
-                for child in parent.winfo_children():
-                    if isinstance(child, tk.Label):
-                        found.append(str(child.cget("text")))
-                    found.extend(_all_labels(child))
-                return found
-
-            texts = _all_labels(viewer.inner)
-            for wanted in ("完成", "清掉", "删除"):
-                if wanted not in texts:
-                    problems.append("归档窗口里没有「%s」这个原因标签: %r" % (wanted, texts))
-            if "删掉的那条" not in texts:
-                problems.append("归档窗口里没有列出条目正文: %r" % (texts,))
-            # 恢复「删除」的那一条：回到列表、从归档里消失、窗口少一行、按状态归位
-            deleted_rec = [r for r in widget.store.archive if r["reason"] == "deleted"][0]
-            if not viewer.restore(deleted_rec):
-                problems.append("从归档窗口恢复一条失败")
-            elif not any(item["id"] == 700003 for item in widget.store.items):
-                problems.append("恢复后条目没有回到列表")
-            elif any(r["item"]["id"] == 700003 for r in widget.store.archive):
-                problems.append("恢复后归档里还留着这一条")
-            elif len(viewer._rows) != 2:
-                problems.append("恢复后归档窗口没有少一行: %r" % (len(viewer._rows),))
-            if Store(path).items and not any(i["id"] == 700003 for i in Store(path).items):
-                problems.append("恢复的那一条没有落盘")
-            # 同一条再恢复一次：应当失败，且不能插两遍
-            if viewer.restore(deleted_rec):
-                problems.append("已经恢复过的条目，再恢复一次应当失败")
-            if len([i for i in widget.store.items if i["id"] == 700003]) != 1:
-                problems.append("重复恢复把条目插了两遍")
-            viewer.close()
-            if viewer.win.winfo_exists():
-                problems.append("归档窗口关闭后控件没销毁")
-            if widget._archive_window is not None:
-                problems.append("归档窗口关闭后主窗口还留着引用")
-            widget.store.remove(700003)           # 收尾：别把恢复进来的测试条留在列表里
-            widget.store.archive = saved_archive
-            widget._refresh()
-            # 页头右键菜单里必须有入口
-            head_labels = " ".join(menu_label(widget.menu, i)
-                                   for i in range(widget.menu.index("end") + 1))
-            if "查看归档" not in head_labels:
-                problems.append("页头右键菜单里没有「查看归档…」入口: %r" % (head_labels,))
-            if "窗口透明度" not in head_labels:
-                problems.append("页头右键菜单里没有「窗口透明度…」: %r" % (head_labels,))
-            # 透明度是一条滑块：拖动即时预览，关掉即保存
-            alpha_dialog = widget.open_alpha_dialog()
-            root.update()
-            scales = [child for child in alpha_dialog.winfo_children()
-                      if isinstance(child, tk.Scale)]
-            if not scales:
-                problems.append("透明度对话框里没有滑块")
-            else:
-                if not scales[0].cget("command"):
-                    problems.append("透明度滑块没有接实时预览")
-                try:
-                    if float(scales[0].cget("from")) >= float(scales[0].cget("to")):
-                        problems.append("透明度滑块的取值范围不对")
-                except (TypeError, ValueError):
-                    problems.append("透明度滑块的取值范围读不出来")
-            widget.set_alpha(0.8, save=False)
-            if abs(float(root.attributes("-alpha")) - 0.8) > 1e-6:
-                problems.append("设置透明度没有作用到窗口: %r"
-                                % (root.attributes("-alpha"),))
-            widget.set_alpha(0.94, save=True)
-            try:
-                alpha_dialog.destroy()
-            except tk.TclError:
-                pass
-            widget._alpha_dialog = None
-
-            # ---- 尺寸：默认排版不能变，拉大后要跟着重排 ----
-            default_w = _scaled(PANEL_W, widget.s)
-            default_h = _scaled(LIST_MAX_H, widget.s)
-            if widget.panel_w != default_w:
-                problems.append("默认面板宽度不对: %r（期望 %r）" % (widget.panel_w, default_w))
-            if widget.list_max_h != default_h:
-                problems.append("默认列表高度上限不对: %r（期望 %r）"
-                                % (widget.list_max_h, default_h))
-            narrow_wrap = widget.row_wrap
-            widget._apply_metrics(default_w + 200)
-            if widget.panel_w != default_w + 200:
-                problems.append("拉宽后没有按新宽度重算: %r" % (widget.panel_w,))
-            if widget.row_wrap <= narrow_wrap:
-                problems.append("拉宽后换行宽度没有跟着变大: %r → %r"
-                                % (narrow_wrap, widget.row_wrap))
-            widget._apply_metrics()
-            if widget.panel_w != default_w or widget.row_wrap != narrow_wrap:
-                problems.append("还原默认尺寸失败: %r / %r"
-                                % (widget.panel_w, widget.row_wrap))
-            if widget._list_space(default_h * 3) <= default_h:
-                problems.append("窗口拉高后没有把多出来的高度给列表")
-
-            # ---- 默认排序：未完成 → 等待中 → 已完成 ----
-            for entry in list(broken.items):          # 先把状态归一，免得受前面用例影响
-                if broken.state_of(entry) == STATE_WAITING:
-                    broken.toggle_waiting(entry["id"])
-                elif broken.state_of(entry) == STATE_DONE:
-                    broken.toggle(entry["id"])
-            widget._refresh()
-            widget._cancel_regroup()                  # 先清干净，免得受前面用例遗留的任务影响
-            first_todo = broken.items[0]
-            order_before = [entry["id"] for entry in broken.items]
-            widget.toggle_item(first_todo["id"])
-            if [entry["id"] for entry in broken.items] != order_before:
-                problems.append("勾选后立刻就把行挪走了（双击改名会因此落空）")
-            if widget._regroup_job is None:
-                problems.append("勾选后没有安排归位")
-            widget._regroup_now()
-            if broken.state_of(broken.items[-1]) != STATE_DONE:
-                problems.append("归位后已完成条目不在最后: %r"
-                                % ([broken.state_of(e) for e in broken.items],))
-            if widget._regroup_job is not None:
-                problems.append("归位之后还留着待执行任务")
-            # 拖拽不跨段：落点被夹在本状态段内
-            widget._refresh()
-            todo_items = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
-            done_indexes = [i for i, e in enumerate(broken.items)
-                            if broken.state_of(e) == STATE_DONE]
-            if todo_items and done_indexes:
-                if widget._clamp_to_group(todo_items[0]["id"], 999) >= done_indexes[0]:
-                    problems.append("拖拽落点没有被限制在本状态段内")
-                if widget._clamp_to_group(todo_items[0]["id"], -5) != 0:
-                    problems.append("拖拽落点下界没有被夹住")
-                # 段内要能跨「今天 / 优先级」自由拖（A 方案）：范围覆盖整个未完成段。
-                # 先把一条设成高优先级、另一条标今天，制造出不同分组，否则"按桶夹取"
-                # 的错误实现也能蒙混过关（反例实测抓到过）。
-                span_probe = todo_items[0]
-                other_todo = None
-                for entry in todo_items[1:]:
-                    if entry["id"] != span_probe["id"]:
-                        other_todo = entry
-                        break
-                widget.store.set_priority(span_probe["id"], PRIORITY_HIGH)
-                widget.store.place_in_bucket(span_probe["id"])
-                if other_todo is not None:
-                    widget.store.toggle_today(other_todo["id"])
-                    widget.store.place_in_bucket(other_todo["id"])
-                widget._refresh()
-                todo_rows = [index for index, (row_id, _) in enumerate(widget.row_widgets)
-                             if broken.state_of(widget._find_item(row_id)) == STATE_TODO]
-                if todo_rows and widget._group_span(span_probe["id"]) != \
-                        (min(todo_rows), max(todo_rows)):
-                    problems.append("同一状态段内不能跨优先级/今天拖动: %r（期望 %r）"
-                                    % (widget._group_span(span_probe["id"]),
-                                       (min(todo_rows), max(todo_rows))))
-                widget.store.set_priority(span_probe["id"], PRIORITY_NONE)
-                if other_todo is not None:
-                    widget.store.toggle_today(other_todo["id"])
-                widget.store.resort()
-                widget._refresh()
-                # 真拖一次：往「已完成」那一段里拖，不能跨过去（跨段只能靠勾选/小钟）
-                dragged = todo_items[0]["id"]
-                done_row = widget._row_widget(broken.items[done_indexes[0]]["id"])
-                widget._begin_drag(dragged)
-                if widget._drop_line is None:
-                    problems.append("开始拖动没有创建落点标记线")
-                widget._drag_to(done_row.winfo_rooty() + 1)
-                if widget._drop_line is not None and \
-                        widget._drop_line.winfo_manager() != "place":
-                    problems.append("拖动中落点标记线没有摆出来")
-                if widget._drag_target is None:
-                    problems.append("拖动中没有记下落点位置（松手时会挪错地方）")
-                widget._end_drag()
-                if widget._drop_line is not None:
-                    problems.append("松手后落点标记线没有清掉")
-                after_items = list(broken.items)
-                dragged_at = [i for i, e in enumerate(after_items) if e["id"] == dragged]
-                done_first = [i for i, e in enumerate(after_items)
-                              if broken.state_of(e) == STATE_DONE]
-                if dragged_at and done_first and dragged_at[0] >= done_first[0]:
-                    problems.append("拖拽把条目拖进了别的状态段: %r"
-                                    % ([e["text"] for e in after_items],))
-                # 有 @标签 筛选时列表比 items 短：拖拽落点必须换算成数据下标，
-                # 拿行号当数据下标会挪错条目（老 bug，2026-10-26 修）
-                probe_txt = "筛选拖动探针"
-                filter_probe = widget.store.add(probe_txt + " @探针")
-                filler = widget.store.add("筛选探针的垫片")   # 让探针不在第 0 个
-                widget._refresh()
-                widget.set_filter("探针")
-                visible_probe = widget._visible_items()
-                if len(visible_probe) == 1 and widget.row_widgets:
-                    expect_index = [i["id"] for i in widget.store.items].index(
-                        filter_probe["id"])
-                    got_index = widget._store_index_for_row(0)
-                    if got_index != expect_index:
-                        problems.append("筛选状态下拖拽落点没有换算成数据下标: %r != %r"
-                                        % (got_index, expect_index))
-                widget.set_filter(None)
-                widget.store.pop(filter_probe["id"])
-                widget.store.pop(filler["id"])
-                widget._refresh()
-            # 编辑期间不归位（归位会重建行、把输入框一起销毁）
-            edit_target = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
-            if edit_target:
-                edit_id = edit_target[0]["id"]
-                widget.toggle_item(edit_id)           # 变成已完成，安排归位
-                widget._begin_edit(edit_id, _StubEvent(x=body_x))
-                if widget._regroup_job is not None:
-                    problems.append("进入编辑时没有取消失效的归位任务")
-                widget._regroup_now()                 # 编辑中触发：应顺延，不该重画
-                if widget._edit_entry is None:
-                    problems.append("编辑中触发归位把输入框销毁了")
-                if widget._regroup_job is None:
-                    problems.append("编辑中触发归位后没有顺延")
-                widget._end_edit(save=False)
-            # 到点提醒：横幅出现 + 清掉提醒（否则每 15 秒响一次）+ 「知道了」收起
-            alert_target = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
-            if alert_target:
-                broken.set_reminder(alert_target[0]["id"], time.time() - 1)
-                widget._redraw_row(alert_target[0]["id"])   # 模拟界面上设提醒后的重画
-                if not widget._row_widget(alert_target[0]["id"]).find_withtag("remind"):
-                    problems.append("到点前条目行尾应当有 ⏰ 时间")
-                widget._remind_tick(raise_it=False)
-                if "⏰" not in str(widget.hint.cget("text")):
-                    problems.append("到点后没有弹出提醒横幅: %r"
-                                    % (widget.hint.cget("text"),))
-                if widget.alert_btn.winfo_manager() != "pack":
-                    problems.append("到点后没有显示「知道了」")
-                if broken.due_reminders():
-                    problems.append("到点提醒没有被清掉，会重复响")
-                alert_row = widget._row_widget(alert_target[0]["id"])
-                if alert_row is not None and alert_row.find_withtag("remind"):
-                    problems.append("到点后行尾 ⏰ 时间没有消失（会一直挂着过期提醒）")
-                widget._dismiss_alert()
-                if widget.alert_btn.winfo_manager() == "pack":
-                    problems.append("点「知道了」后横幅没有收起")
-            root.update()
-            root.withdraw()
-            root.update()
-            root.destroy()
-        except Exception as error:      # 不限于 TclError：代码里的笔误也要在这里暴露
+            app._remind_stop()
+            app._cancel_regroup()
+            app._hide_undo()
+        except Exception as error:      # 代码里的笔误也要在这里暴露
             import traceback
-            problems.append("界面/拖拽自检失败: %r\n%s"
+            problems.append("界面自检失败: %r\n%s"
                             % (error, traceback.format_exc()))
+        finally:
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -5662,311 +5371,333 @@ def run_check():
     return 0
 
 
+
 # --------------------------------------------------------------------------- #
 # 诊断（--doctor）
 #
-# 用途：把「必须盯着桌面看一眼」才能确认的事，压成一段可以复制粘贴回来的文本
-# （排障时贴给别人 / 贴进 issue 都行）。每个能力都尽量「写进去、再读回来」验证，
-# 而不是「调用没报错就算成功」。
+# 用途：把「必须盯着桌面看一眼」才能确认的事，压成一段可以复制粘贴回来的文本。
 # 只读：不改数据、不写配置；只额外建一个隐藏窗口做探测。
 # --------------------------------------------------------------------------- #
-def _x11_read_property(x11, display, window, atom, length=8):
-    """读回一个 32 位 X 属性，返回整数列表；读不到返回 []。"""
-    actual_type = ctypes.c_ulong()
-    actual_format = ctypes.c_int()
-    nitems = ctypes.c_ulong()
-    bytes_after = ctypes.c_ulong()
-    prop = ctypes.POINTER(ctypes.c_ulong)()
+def session_kind():
+    """判断图形会话类型，返回 (kind, detail)。
+
+    kind: "x11" / "wayland" / "xwayland" / "headless"。
+    本程序的全局快捷键、窗口置顶、唤回都走 X11（libX11 + XGrabKey），
+    在 Wayland 会话下可能**静默失效** —— 这里只负责判断，好让界面和 --doctor
+    把话说清楚，而不是让用户以为程序坏了。
+    """
+    backend = None
+    if Gdk is not None:
+        try:
+            display = Gdk.Display.get_default()
+        except Exception:
+            display = None
+        if display is not None:
+            name = type(display).__name__.lower()
+            if "wayland" in name:
+                backend = "wayland"
+            elif "x11" in name:
+                backend = "x11"
+    session = (os.environ.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if backend == "wayland":
+        return "wayland", "Wayland（GTK 使用 Wayland 后端）"
+    if session == "wayland":
+        if backend == "x11":
+            return "xwayland", "Wayland 会话 + XWayland（GTK 走 X11）"
+        return "wayland", "Wayland（XDG_SESSION_TYPE=wayland）"
+    if backend == "x11" or session == "x11":
+        return "x11", "X11"
+    return "headless", "无法判断会话类型（没有可用的图形显示）"
+
+
+def _x11_load():
     try:
-        status = x11.XGetWindowProperty(
-            ctypes.c_void_p(display), ctypes.c_ulong(window), ctypes.c_ulong(atom),
-            0, length, 0, 0,
-            ctypes.byref(actual_type), ctypes.byref(actual_format),
-            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop))
-    except Exception:
-        return []
-    if status != 0 or not prop:
-        return []
-    values = []
-    if nitems.value:
-        values = [int(prop[index]) for index in range(int(nitems.value))]
-    try:
-        x11.XFree(prop)
-    except Exception:
-        pass
-    return values
-
-
-def _doctor_x11(root, rows, caps):
-    """X11 侧探测：把 Motif / EWMH 属性真的写进去，再读回来确认。"""
-    seen = {}
-
-    def probe_motif(x11, display, target, root_window):
-        atom = x11.XInternAtom(ctypes.c_void_p(display), b"_MOTIF_WM_HINTS", 0)
-        values = (ctypes.c_ulong * 5)(2, 0, 0, 0, 0)
-        x11.XChangeProperty(ctypes.c_void_p(display), ctypes.c_ulong(target),
-                            ctypes.c_ulong(atom), ctypes.c_ulong(atom), 32, 0,
-                            ctypes.byref(values), 5)
-        seen["target"] = int(target)
-        seen["motif"] = _x11_read_property(x11, display, target, atom)
-
-    def probe_state(x11, display, target, root_window):
-        state_atom = x11.XInternAtom(ctypes.c_void_p(display), b"_NET_WM_STATE", 0)
-        skip_taskbar = x11.XInternAtom(ctypes.c_void_p(display),
-                                       b"_NET_WM_STATE_SKIP_TASKBAR", 0)
-        skip_pager = x11.XInternAtom(ctypes.c_void_p(display),
-                                     b"_NET_WM_STATE_SKIP_PAGER", 0)
-        atoms = (ctypes.c_ulong * 2)(skip_taskbar, skip_pager)
-        x11.XChangeProperty(ctypes.c_void_p(display), ctypes.c_ulong(target),
-                            ctypes.c_ulong(state_atom), ctypes.c_ulong(4), 32, 0,
-                            ctypes.byref(atoms), 2)
-        seen["skip_wanted"] = [int(skip_taskbar), int(skip_pager)]
-        seen["skip_read"] = _x11_read_property(x11, display, target, state_atom)
-
-    if not _on_wm_window(root, probe_motif):
-        rows.append("[x11]   连接不可用：libX11.so.6 缺失 / DISPLAY 无效 / 窗口还没建出来")
-        caps.append(("去标题栏（Motif）", "N/A", "没有可用的 X 连接"))
-        caps.append(("不进任务栏（EWMH）", "N/A", "没有可用的 X 连接"))
-        return
-
-    rows.append("[x11]   WM 顶层窗口 = 0x%x" % seen.get("target", 0))
-    motif = seen.get("motif") or []
-    if len(motif) >= 5 and motif[0] == 2 and motif[2] == 0:
-        rows.append("[x11]   _MOTIF_WM_HINTS 回读 = %r（decorations=0）" % (motif,))
-        caps.append(("去标题栏（Motif）", "OK", "回读确认 decorations=0"))
-    else:
-        rows.append("[x11]   _MOTIF_WM_HINTS 回读 = %r（空或不符合预期）" % (motif,))
-        caps.append(("去标题栏（Motif）", "WARN", "回读 %r" % (motif,)))
-
-    _on_wm_window(root, probe_state)
-    wanted = seen.get("skip_wanted") or []
-    got = seen.get("skip_read") or []
-    if wanted and all(atom in got for atom in wanted):
-        rows.append("[x11]   _NET_WM_STATE 回读含 SKIP_TASKBAR + SKIP_PAGER")
-        caps.append(("不进任务栏（EWMH）", "OK", "SKIP_TASKBAR/SKIP_PAGER 已写入"))
-    else:
-        rows.append("[x11]   _NET_WM_STATE 回读 = %r（期望包含 %r）" % (got, wanted))
-        caps.append(("不进任务栏（EWMH）", "WARN", "回读 %r" % (got,)))
-
-    rows.append("[x11]   映射后 ClientMessage 补发 = %s" % set_skip_taskbar(root))
-    filehandler = hasattr(root.tk, "createfilehandler")
-    rows.append("[x11]   tk.createfilehandler 可用 = %s" % filehandler)
-    caps.append(("单实例唤回（filehandler）", "OK" if filehandler else "WARN",
-                 "unix 套接字 + Tk 文件事件"))
-
-
-def _doctor_instance(rows, caps):
-    """单实例与唤回机制的探测：AF_UNIX 套接字能不能绑定。"""
-    path = ipc_socket_path()
-    rows.append("[ipc]   套接字路径 = %s（已存在=%s）" % (path, os.path.exists(path)))
-    probe = path + ".doctor"
-    try:
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        if os.path.exists(probe):
-            os.unlink(probe)
-        server.bind(probe)
-        server.listen(1)
-        server.close()
-        os.unlink(probe)
-        caps.append(("单实例", "OK", "AF_UNIX 可绑定"))
-    except Exception as error:
-        caps.append(("单实例", "FAIL", repr(error)))
+        return ctypes.CDLL("libX11.so.6")
+    except (ImportError, OSError):
+        return None
 
 
 def run_doctor():
-    """打印一份可粘贴的诊断报告（只读，不改数据/配置）。"""
-    rows, caps = [], []
+    rows = []
+    caps = []
+    if gtk_ready():
+        install_css()
 
-    def row(section, key, value):
-        rows.append("[%s] %s = %s" % (section, key, value))
+    def row(name, verdict, detail=""):
+        rows.append("%-4s %-24s %s" % (verdict, name, detail))
+        caps.append((name, verdict, detail))
 
-    # ---- 环境与路径 ----
-    row("env", "os / sys.platform", "posix / %s" % sys.platform)
-    row("env", "窗口外观", "X11（Motif 去标题栏 + EWMH SKIP_TASKBAR/SKIP_PAGER）")
-    row("env", "唤回方式", "全局快捷键 / 再运行一次本程序 / 应用菜单")
-    row("env", "python", sys.version.split()[0])
-    row("env", "脚本路径", os.path.abspath(__file__))
-    row("env", "tk", "Tk %s" % tk.TkVersion if tk else "缺失（统信 UOS: apt install python3-tk）")
-    row("env", "DISPLAY", os.environ.get("DISPLAY") or "(未设置)")
-    row("env", "WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY") or "(未设置)")
-    row("env", "XDG_DATA_HOME", os.environ.get("XDG_DATA_HOME") or "(未设置)")
-    row("env", "XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR") or "(未设置)")
-    row("path", "数据文件", data_file())
-    row("path", "单实例套接字", ipc_socket_path())
-    row("path", "开机自启", autostart_path())
-    app_entry = app_entry_target()
-    row("path", "应用菜单条目", "%s（%s）" % (
-        app_entry, "已存在" if os.path.exists(app_entry) else "不存在"))
+    row(tr("版本", "version"), "OK", tr("desktop-todo %s（GTK3 版）", "desktop-todo %s (GTK3)") % APP_VERSION)
+    row("Python", "OK", sys.version.split()[0])
 
-    # ---- 数据文件（只读）----
-    path = data_file()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            items = payload.get("items") or []
-
-            def _state_of(entry):
-                value = str(entry.get("state") or "")
-                if value in (STATE_TODO, STATE_WAITING, STATE_DONE):
-                    return value
-                return STATE_DONE if entry.get("done") else STATE_TODO
-
-            done = len([item for item in items if _state_of(item) == STATE_DONE])
-            waiting = len([item for item in items if _state_of(item) == STATE_WAITING])
-            row("data", "条目", "%d 条（未完成 %d / 等待中 %d / 已完成 %d）"
-                % (len(items), len(items) - done - waiting, waiting, done))
-            caps.append(("数据文件可读", "OK", "%d 条" % len(items)))
-        except Exception as error:
-            row("data", "读取", "失败：%r" % (error,))
-            caps.append(("数据文件可读", "FAIL", repr(error)))
+    if Gtk is None:
+        row("GTK", "FAIL", "缺少 python3-gi / GTK3（sudo apt install python3-gi "
+                           "gir1.2-gtk-3.0）")
     else:
-        row("data", "条目", "文件不存在（首次运行会创建）")
-        caps.append(("数据文件可读", "N/A", "还没有数据文件"))
+        row("PyGObject", "OK", getattr(gi, "__version__", "?"))
+        row("GTK", "OK", "%d.%d.%d" % (Gtk.get_major_version(),
+                                       Gtk.get_minor_version(),
+                                       Gtk.get_micro_version()))
+        display = Gdk.Display.get_default()
+        row(tr("GDK 显示", "GDK display"), "OK" if display else "FAIL",
+            display.get_name() if display else tr("连不上 X 显示", "cannot connect to the X display"))
+        kind, detail = session_kind()
+        if kind == "x11":
+            row(tr("会话类型", "session type"), "OK", detail)
+        elif kind == "headless":
+            row(tr("会话类型", "session type"), "WARN", detail)
+        else:
+            row(tr("会话类型", "session type"), "WARN",
+                tr("%s：全局快捷键 / 置顶 / 唤回依赖 X11，可能不可用", "%s: global hotkey / always-on-top / recall depend on X11 and may not work") % detail)
+        screen = Gdk.Screen.get_default()
+        row(tr("合成器", "compositor"), "OK" if screen and screen.is_composited() else "WARN",
+            tr("已开启（窗口圆角/阴影由 KWin 合成）", "on (window corners/shadows composited)") if screen and screen.is_composited()
+            else tr("未开启：圆角不会生效，窗口会显示成直角", "off: corners will not be rounded"))
+        row("RGBA visual", "OK" if screen and screen.get_rgba_visual() else "WARN",
+            tr("可用", "available") if screen and screen.get_rgba_visual() else tr("不可用", "unavailable"))
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            row(tr("GTK 主题", "GTK theme"), "OK", str(settings.get_property("gtk-theme-name")))
+            row(tr("深色偏好", "dark preference"), "OK",
+                tr("深色", "dark") if settings.get_property("gtk-application-prefer-dark-theme")
+                else tr("浅色", "light"))
+            row(tr("系统字体", "system font"), "OK", str(settings.get_property("gtk-font-name")))
+        else:
+            row(tr("GTK 主题", "GTK theme"), "WARN", tr("取不到 GtkSettings", "cannot read GtkSettings"))
 
-    directory = data_dir()
-    if os.path.isdir(directory):
-        caps.append(("数据目录可写", "OK" if os.access(directory, os.W_OK) else "FAIL",
-                     directory))
-    else:
-        parent = os.path.dirname(directory)
-        caps.append(("数据目录可写", "OK" if os.access(parent, os.W_OK) else "WARN",
-                     "未建，父目录 %s" % parent))
-
-    # ---- 单实例 / 唤回 ----
-    _doctor_instance(rows, caps)
-
-    # ---- 开机自启：Deepin/UOS 上两个文件必须配套，否则 startdde 会删掉自启项 ----
-    autostart = autostart_path()
-    app_entry = app_entry_target()
-    has_auto = os.path.exists(autostart)
-    has_app = os.path.exists(app_entry)
-    if has_auto and has_app:
-        caps.append(("开机自启", "OK", "自启项 + 应用条目都在"))
-    elif has_auto and not has_app:
-        caps.append(("开机自启", "WARN",
-                     "缺应用条目，Deepin/UOS 的 startdde 会把自启项删掉"))
-    elif has_app and not has_auto:
-        caps.append(("开机自启", "WARN", "有应用条目但还没装自启项"))
-    else:
-        caps.append(("开机自启", "N/A", "尚未安装（--install-autostart）"))
-
-    # ---- 窗口能力（需要一个隐藏窗口）----
-    root = None
-    if tk is None:
-        row("tk", "tkinter", "缺失：界面与窗口能力检查全部跳过")
-        caps.append(("Tk 窗口", "FAIL",
-                     "缺少 tkinter（统信 UOS / Debian: sudo apt install python3-tk）"))
-        caps.append(("去标题栏", "N/A", "缺少 tkinter"))
-        caps.append(("不进任务栏", "N/A", "缺少 tkinter"))
-        caps.append(("中文字体", "N/A", "缺少 tkinter"))
-    else:
+    # ---- 窗口能力：真的建一个隐藏窗口，写进去再读回来 ----
+    if Gtk is not None and gtk_ready():
+        win = None
         try:
-            root = tk.Tk()
-            root.title("desktop-todo doctor")
-            root.withdraw()
-            root.update_idletasks()
+            win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            win.set_decorated(False)
+            win.set_skip_taskbar_hint(True)
+            win.set_skip_pager_hint(True)
+            win.set_keep_above(True)
+            set_window_opacity(win, 0.9)
+            win.show_all()
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            row(tr("去标题栏", "undecorated"), "OK" if not win.get_decorated() else "FAIL",
+                "set_decorated(False)")
+            row(tr("不进任务栏", "skip taskbar"), "OK" if win.get_skip_taskbar_hint() else "FAIL",
+                "skip-taskbar=%s skip-pager=%s"
+                % (win.get_skip_taskbar_hint(), win.get_skip_pager_hint()))
+            row(tr("置顶能力", "always-on-top"), "OK", tr("set_keep_above(True) 已调用", "set_keep_above(True) called"))
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                opacity = win.get_opacity()
+            row(tr("透明度", "opacity"), "OK" if abs(opacity - 0.9) < 0.01 else "WARN",
+                "set_opacity=%0.2f" % opacity)
+            xid = win.get_window().get_xid() if win.get_window() else 0
+            row(tr("X11 窗口 id", "X11 window id"), "OK" if xid else "FAIL", "0x%x" % (xid or 0))
+            if xid:
+                shim = GtkRootShim(win)
+
+                reached = _on_wm_window(shim, lambda *_args: None)
+                row("X11 / EWMH", "OK" if reached else "WARN",
+                    tr("XQueryTree 能找到 WM 窗口", "XQueryTree found the WM window") if reached
+                    else tr("找不到 WM 窗口（窗口还没建出来？）", "WM window not found (window not mapped yet?)"))
         except Exception as error:
-            row("tk", "创建隐藏窗口", "失败：%r" % (error,))
-            caps.append(("Tk 窗口", "FAIL", repr(error)))
-
-    if root is not None:
-        caps.append(("Tk 窗口", "OK", "Tk %s" % tk.TkVersion))
-        try:
-            scaling = float(root.tk.call("tk", "scaling"))
-            factor = ui_scale(root)
-            row("scale", "tk scaling", "%.3f" % scaling)
-            row("scale", "界面缩放", "%.2f 倍（面板宽 %d px）"
-                % (factor, _scaled(PANEL_W, factor)))
-        except Exception:
-            pass
-        try:
-            _doctor_x11(root, rows, caps)
-        except Exception as error:
-            row("probe", "窗口能力探测", "异常：%r" % (error,))
-        # ---- 全局快捷键：真去抓一次，再解开（抓不上通常是键被别的程序/已有实例占了）----
-        hotkey_spec = HOTKEY_DEFAULT
-        try:
-            hotkey_spec = Store(data_file()).ui.get("hotkey") or HOTKEY_DEFAULT
-        except Exception:
-            pass
-        installed = False
-        try:
-            installed = hotkey_install(root, hotkey_spec, lambda stamp=None: None)
-        except Exception as error:
-            row("hotkey", "注册", "异常：%r" % (error,))
+            row(tr("窗口能力", "window capability"), "FAIL", "%r" % (error,))
         finally:
-            try:
-                hotkey_remove()
-            except Exception:
-                pass
-        row("hotkey", "全局快捷键", "%s（%s）" % (
-            format_hotkey(hotkey_spec),
-            "注册成功" if installed else
-            "没注册上：要么已经有实例在跑（它正占着这个键），要么被别的程序占了；"
-            "换一个用 --hotkey Ctrl+Alt+K"))
-        caps.append(("全局快捷键", "OK" if installed else "WARN",
-                     format_hotkey(hotkey_spec)))
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+    else:
+        row(tr("窗口能力", "window capability"), "N/A", tr("缺少 GTK / 显示，跳过", "no GTK / display, skipped"))
+
+    if _x11_load() is None:
+        row("libX11", "FAIL", tr("libX11.so.6 载入失败（全局快捷键/唤回不可用）", "libX11.so.6 failed to load (hotkey/recall unavailable)"))
+    else:
+        row("libX11", "OK", "libX11.so.6")
+
+    hotkey_ok = parse_hotkey(HOTKEY_DEFAULT) is not None
+    row(tr("快捷键解析", "hotkey parsing"), "OK" if hotkey_ok else "FAIL", HOTKEY_DEFAULT)
+
+    path = data_file()
+    row(tr("数据文件", "data file"), "OK" if os.path.exists(path) else "WARN",
+        "%s%s" % (path, "" if os.path.exists(path) else tr("（还没有，首次保存时创建）", " (not yet; created on first save)")))
+    directory = os.path.dirname(path)
+    writable = os.path.isdir(directory) or os.path.isdir(os.path.dirname(directory))
+    row(tr("数据目录可写", "data directory writable"), "OK" if writable else "FAIL", directory)
+    try:
+        store = Store(path)
+        row(tr("条目 / 归档", "items / archive"), "OK", tr("%d 条待办 / %d 条归档", "%d to-dos / %d archived")
+            % (len(store.items), len(store.archive)))
+        row(tr("数据格式", "data format"), "OK", "version %d" % DATA_VERSION)
+        if store.load_error:
+            row(tr("数据版本检查", "data version check"), "WARN", store.load_error)
+        newer_path = path + ".newer"
+        if os.path.exists(newer_path):
+            row(tr("更新版本备份", "newer-version backup"), "WARN",
+                tr("发现 %s（更新版本写的数据，已保留未覆盖）", "found %s (data written by a newer version, kept untouched)") % newer_path)
+    except Exception as error:
+        row(tr("条目 / 归档", "items / archive"), "FAIL", "%r" % (error,))
+
+    row(tr("单实例套接字", "single-instance socket"), "OK", ipc_socket_path())
+    row(tr("唤回日志", "recall log"), "OK", os.path.join(os.path.dirname(path), "hotkey.log"))
+    crash_path = os.path.join(directory, "crash.log")
+    if os.path.exists(crash_path):
+        row(tr("崩溃日志", "crash log"), "WARN", tr("存在 %s（反馈时附上）", "found %s (attach it when reporting)") % crash_path)
+    row(tr("主题开关", "theme switch"), "OK", tr("DESKTOP_TODO_THEME=%s（默认 dark；light 跟随浅色）", "DESKTOP_TODO_THEME=%s (default dark; light follows light)")
+        % ("light" if _THEME_NAME == "light" else "dark"))
+    if display is not None:
         try:
-            families = set(tkfont.families())
-            chosen = None
-            for name in FONT_STACK:
-                if name in families:
-                    chosen = name
-                    break
-            missing = [name for name in FONT_STACK if name not in families]
-            row("font", "命中", chosen or "(都没命中，用 Tk 默认字体)")
-            row("font", "未命中", ", ".join(missing) or "无")
-            caps.append(("中文字体", "OK" if chosen else "WARN", chosen or "回落 Tk 默认"))
-        except Exception as error:
-            row("font", "枚举", "失败：%r" % (error,))
-            caps.append(("中文字体", "FAIL", repr(error)))
-        try:
-            root.destroy()
+            count = display.get_n_monitors()
+            parts = []
+            for index in range(min(count, 4)):
+                geometry = display.get_monitor(index).get_geometry()
+                parts.append("%dx%d@%d,%d" % (geometry.width, geometry.height,
+                                              geometry.x, geometry.y))
+            row(tr("显示器", "monitors"), "OK", tr("%d 个：%s", "%d: %s") % (count, " / ".join(parts)))
         except Exception:
             pass
+    row(tr("界面缩放", "UI scaling"), "OK", tr("由系统 DPI / GTK 缩放决定（不再自己算像素）", "decided by system DPI / GTK scaling"))
 
-    # ---- 报告 ----
     print("=" * 68)
-    print("desktop-todo %s 诊断报告（--doctor）" % APP_VERSION)
+    print(tr("desktop-todo %s 诊断报告（--doctor）", "desktop-todo %s diagnostics (--doctor)") % APP_VERSION)
     print("=" * 68)
     for line in rows:
         print(line)
     print("-" * 68)
     counts = {"OK": 0, "WARN": 0, "FAIL": 0, "N/A": 0}
-    for name, verdict, detail in caps:
+    for _name, verdict, _detail in caps:
         counts[verdict] = counts.get(verdict, 0) + 1
-        print("%-4s %-26s %s" % (verdict, name, detail))
-    print("-" * 68)
-    print("结论：OK %d / WARN %d / FAIL %d / N/A %d"
+    print(tr("结论：OK %d / WARN %d / FAIL %d / N/A %d", "summary: OK %d / WARN %d / FAIL %d / N/A %d")
           % (counts["OK"], counts["WARN"], counts["FAIL"], counts["N/A"]))
     print("DOCTOR DONE")
     return 0
 
 
+
+# --------------------------------------------------------------------------- #
+# 命令行入口
+# --------------------------------------------------------------------------- #
+def _write_crash_log(error):
+    """把未捕获异常写到本地 crash.log；返回路径（失败返回 None）。"""
+    try:
+        directory = data_dir()
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        path = os.path.join(directory, "crash.log")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("=" * 64 + "\n")
+            handle.write("%s  desktop-todo %s  session=%s  python=%s\n"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S"), APP_VERSION,
+                            session_kind()[0], sys.version.split()[0]))
+            handle.write("".join(traceback.format_exception(
+                type(error), error, error.__traceback__)))
+        return path
+    except Exception:
+        return None
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="桌面待办清单挂件")
+    parser = argparse.ArgumentParser(
+        description=tr("桌面待办清单挂件", "Desktop to-do widget"))
     parser.add_argument("--version", action="version",
                         version="desktop-todo %s" % APP_VERSION)
-    parser.add_argument("--check", action="store_true", help="自检数据读写与界面构造后退出")
-    parser.add_argument("--doctor", action="store_true", help="打印环境/窗口能力诊断报告后退出")
-    parser.add_argument("--install-autostart", action="store_true", help="写入 ~/.config/autostart 开机自启")
-    parser.add_argument("--uninstall-autostart", action="store_true", help="移除开机自启")
-    parser.add_argument("--data-file", action="store_true", help="打印数据文件路径后退出")
-    parser.add_argument("--hotkey", metavar="键位",
-                        help="设置全局唤回快捷键后退出（如 Super+T、Ctrl+Alt+K）")
+    parser.add_argument("--check", action="store_true",
+                        help=tr("自检数据读写与界面构造后退出",
+                              "Run self-check (data + UI) and exit"))
+    parser.add_argument("--doctor", action="store_true",
+                        help=tr("打印环境/窗口能力诊断报告后退出",
+                              "Print environment/window diagnostics and exit"))
+    parser.add_argument("--install-autostart", action="store_true",
+                        help=tr("写入 ~/.config/autostart 开机自启",
+                              "Install ~/.config/autostart entry"))
+    parser.add_argument("--uninstall-autostart", action="store_true",
+                        help=tr("移除开机自启", "Remove the autostart entry"))
+    parser.add_argument("--data-file", action="store_true",
+                        help=tr("打印数据文件路径后退出", "Print the data file path and exit"))
+    parser.add_argument("--import-todotxt", dest="import_todotxt", metavar=tr("文件", "FILE"),
+                        help=tr("把 todo.txt 文件合并进当前数据后退出",
+                                "Merge a todo.txt file into the current data and exit"))
+    parser.add_argument("--add", metavar=tr("文本", "TEXT"),
+                        help=tr("把一条待办发给正在运行的实例（没有实例则直接写数据文件）后退出",
+                              "Send a to-do to the running instance (or write it directly)"))
+    parser.add_argument("--export", metavar=tr("文件", "FILE"),
+                        help=tr("导出数据后退出（.json 为完整备份；.csv 供表格查看）",
+                              "Export data and exit (.json = full backup; .csv = spreadsheet)"))
+    parser.add_argument("--import", dest="import_path", metavar=tr("文件", "FILE"),
+                        help=tr("从 JSON 备份恢复（会先备份当前数据）后退出",
+                              "Restore from a JSON backup (current data is backed up first)"))
+    parser.add_argument("--hotkey", metavar=tr("键位", "KEY"),
+                        help=tr("设置全局唤回快捷键后退出（如 Super+T、Ctrl+Alt+K）",
+                              "Set the global recall hotkey (e.g. Super+T, Ctrl+Alt+K)"))
     args = parser.parse_args(argv)
 
-    if args.check:
-        return run_check()
-    if args.doctor:
-        return run_doctor()
     if args.install_autostart:
         return autostart_install()
     if args.uninstall_autostart:
         return autostart_uninstall()
     if args.data_file:
         print(data_file())
+        return 0
+    if args.add is not None:
+        text = args.add.strip()
+        if not text:
+            sys.stderr.write("--add 需要非空文本\n")
+            return 2
+        if raise_running_instance(("add\t%s\n" % text).encode("utf-8")):
+            print("已添加到正在运行的桌面待办：%s" % text)
+            return 0
+        store = Store(data_file())
+        item = store.add(text)
+        if item is None:
+            sys.stderr.write("添加失败（文本为空？）\n")
+            return 1
+        print("没有运行中的实例，已直接写入数据文件：%s（下次启动可见）" % text)
+        return 0
+    if args.export:
+        store = Store(data_file())
+        out = os.path.abspath(os.path.expanduser(args.export))
+        try:
+            if out.lower().endswith(".csv"):
+                count = store.export_csv(out)
+                print("已导出 %d 条待办到 %s（CSV，供表格查看，不能用于恢复）"
+                      % (count, out))
+            else:
+                count = store.export_json(out)
+                print("已导出 %d 条待办、%d 条归档到 %s"
+                      % (count, len(store.archive), out))
+        except (IOError, OSError) as error:
+            sys.stderr.write("导出失败：%s\n" % (error,))
+            return 1
+        return 0
+    if args.import_path:
+        store = Store(data_file())
+        source = os.path.abspath(os.path.expanduser(args.import_path))
+        backup = store.backup_copy("import-backup")
+        try:
+            count, archived = store.import_json(source)
+        except (IOError, OSError, ValueError) as error:
+            sys.stderr.write("导入失败：%s\n" % (error,))
+            if backup:
+                sys.stderr.write("当前数据没有改动（已备份到 %s）\n" % backup)
+            return 1
+        print("已导入 %d 条待办、%d 条归档。导入前的数据备份在：%s"
+              % (count, archived, backup or "（当时还没有数据文件）"))
+        return 0
+    if args.import_todotxt:
+        store = Store(data_file())
+        source = os.path.abspath(os.path.expanduser(args.import_todotxt))
+        backup = store.backup_copy("import-backup")
+        try:
+            added = store.import_todotxt(source)
+        except (IOError, OSError, ValueError) as error:
+            sys.stderr.write(tr("导入失败：%s\n", "Import failed: %s\n") % (error,))
+            if backup:
+                sys.stderr.write(tr("当前数据没有改动（已备份到 %s）\n",
+                                    "Current data unchanged (backup: %s)\n") % backup)
+            return 1
+        print(tr("已从 todo.txt 合并 %d 条（导入前备份：%s）",
+                 "Merged %d items from todo.txt (backup: %s)")
+              % (added, backup or tr("当时还没有数据文件", "none")))
         return 0
     if args.hotkey:
         if parse_hotkey(args.hotkey) is None:
@@ -5980,28 +5711,54 @@ def main(argv=None):
               % format_hotkey(args.hotkey))
         return 0
 
-    if tk is None:
-        sys.stderr.write("缺少 tkinter，无法启动界面（统信 UOS / Debian: "
-                         "sudo apt install python3-tk）\n")
+    if not gtk_ready():
+        sys.stderr.write("缺少 GTK3（统信 UOS / Debian: "
+                         "sudo apt install python3-gi gir1.2-gtk-3.0），"
+                         "或连不上图形显示。\n")
         return 1
+
+    if args.check:
+        return run_check()
+    if args.doctor:
+        return run_doctor()
 
     if raise_running_instance():
         print("桌面待办清单已经在运行，已把它叫到最前面（任务栏里没有它，这是唤回方式）。")
         return 0
 
+    kind, detail = session_kind()
+    if kind in ("wayland", "xwayland"):
+        sys.stderr.write("提示：%s。全局快捷键 / 置顶 / 唤回依赖 X11，可能不可用。\n"
+                         % detail)
+
+    install_css()
     # WM_CLASS 用 APP_ID，与 .desktop 的 StartupWMClass 对上（Deepin/UOS 靠它认应用）
-    root = tk.Tk(className=APP_ID)
-    widget = TodoWidget(root, Store(data_file()))
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            win.set_wmclass(APP_ID, APP_ID)   # StartupWMClass 靠它认应用
+    except Exception:
+        pass
+    window = TodoWindow(win, Store(data_file()))
     if os.environ.get("DESKTOP_TODO_VERBOSE"):
         # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到快捷键挂上没有
-        # （重定向到文件时 stdout 是块缓冲，所以每行都 flush）
         print("全局快捷键 = %s（%s）" % (
-            format_hotkey(getattr(widget, "_hotkey_spec", "")),
-            "已注册" if getattr(widget, "_hotkey_on", False) else "没注册上"), flush=True)
+            format_hotkey(getattr(window, "_hotkey_spec", "")),
+            "已注册" if getattr(window, "_hotkey_on", False) else "没注册上"),
+            flush=True)
         print("数据文件 = %s" % data_file(), flush=True)
-    root.mainloop()
+    Gtk.main()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:      # 未捕获异常留现场：crash.log 里没有待办正文
+        path = _write_crash_log(error)
+        sys.stderr.write("崩溃：%r\n" % (error,))
+        if path:
+            sys.stderr.write("现场已写入 %s（反馈时附上即可）\n" % path)
+        raise

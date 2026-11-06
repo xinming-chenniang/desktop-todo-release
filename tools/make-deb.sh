@@ -7,12 +7,24 @@
 #
 # 设计取舍：
 #   * 程序装到 /opt/desktop-todo/，/usr/bin/desktop-todo 只是三行 wrapper；
-#   * 依赖声明 python3-tk —— 缺 tkinter 时由包管理器装，而不是让用户看到 ImportError；
+#   * 依赖声明 python3-gi / gir1.2-gtk-3.0 —— 缺 GTK3 时由包管理器装，而不是让用户看到 ImportError；
 #   * 卸载不删用户数据（~/.local/share/desktop-todo），在说明里写清楚。
 
 set -eu
 
 cd "$(dirname "$0")/.."
+
+# 可复现构建：固定时间戳。同一份源码 + 同一个 SOURCE_DATE_EPOCH → 同一份 deb 字节，
+# 第三方可以自己重打一遍核对哈希。优先级：环境变量 > 最近一次 commit 时间 > 当前时间。
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || true)
+fi
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(date +%s)
+    echo "!! 没有 SOURCE_DATE_EPOCH、也没有 git 历史：本次构建不可复现" >&2
+fi
+export SOURCE_DATE_EPOCH
+echo "== SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 VERSION=$(python3 - <<'PY'
 import re
 print(re.search(r'^APP_VERSION = "([^"]+)"', open('desktop_todo.py', encoding='utf-8').read(), re.M).group(1))
@@ -42,14 +54,14 @@ install -m 755 desktop_todo.py                 "$STAGE/opt/$PKG/desktop_todo.py"
 install -m 755 packaging/desktop-todo          "$STAGE/usr/bin/$PKG"
 install -m 644 packaging/desktop-todo.desktop  "$STAGE/usr/share/applications/$PKG.desktop"
 install -m 644 packaging/desktop-todo.svg      "$STAGE/usr/share/icons/hicolor/scalable/apps/$PKG.svg"
-install -m 644 README.md SECURITY.md CHANGELOG.md "$STAGE/usr/share/doc/$PKG/"
+install -m 644 README.md SECURITY.md CHANGELOG.md LICENSE "$STAGE/usr/share/doc/$PKG/"
 install -m 755 packaging/postinst              "$STAGE/DEBIAN/postinst"
 install -m 755 packaging/postrm                "$STAGE/DEBIAN/postrm"
 
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: desktop-todo
-Source: https://github.com/xinming-chenniang/desktop-todo
+Source: https://gitee.com/xinming-chenniang/desktop-todo
 
 Files: *
 Copyright: 2026 YanH
@@ -64,7 +76,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.7), python3-tk, libx11-6
+Depends: python3 (>= 3.7), python3-gi, gir1.2-gtk-3.0, libx11-6
 Installed-Size: $SIZE
 Maintainer: xinming-chenniang <xinming-chenniang@users.noreply.github.com>
 Homepage: https://gitee.com/xinming-chenniang/desktop-todo
@@ -72,7 +84,7 @@ Description: 桌面待办清单挂件（统信 UOS / Deepin）
  常驻桌面右上角的待办清单：无标题栏、可拖动、回车即记，支持三态（未完成 /
  等待中 / 已完成）、子步骤、优先级、情境标签与到点提醒。
  .
- 单文件、只用 Python 标准库、不联网、无账号；数据保存在本机
+ 单文件、Python 标准库 + 系统 GTK3、不联网、无账号；数据保存在本机
  ~/.local/share/desktop-todo/todos.json。
 EOF
 
