@@ -69,7 +69,7 @@ except (ImportError, ValueError):      # 没装 python3-gi 时 --doctor / --data
 APP_ID = "desktop-todo"
 # 商店规范要求倒置域名做包名；窗口类名/数据目录仍用 APP_ID，避免老用户数据搬家
 APP_STORE_ID = "com.github.xinming-chenniang.desktoptodo"
-APP_VERSION = "0.5.0"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
+APP_VERSION = "0.5.1"      # 发布版本；--version 打印它，--doctor 报告头部也带着它
 DATA_VERSION = 1           # todos.json 的格式版本；改结构时 +1，并在 MIGRATIONS 里补迁移
 MIGRATIONS = {}            # {旧版本号: 函数(raw)->raw}；目前没有历史格式，先留好升级路径
 
@@ -621,44 +621,22 @@ class X11Hotkey(object):
         self.callback = None
         self.job = None
         self.spec = None
+        # 失败原因代码（"" = 没失败），交给界面/--doctor 翻译成人话：
+        # "parse" / "x11" / "layout" / "occupied"
+        self.last_error = ""
 
     # ---- 注册 / 注销 ----
     def install(self, root, spec, callback):
-        parsed = parse_hotkey(spec)
-        if parsed is None:
+        """注册；失败时 last_error 是原因代码，由调用方决定怎么告诉用户。"""
+        prepared = self._prepare(spec)
+        if prepared is None:
             return False
-        mods, key = parsed
-        x11 = self._open()
-        if x11 is None:
-            return False
-        keysym = x11.XStringToKeysym(key.encode("ascii"))
-        if not keysym:
-            self._close(x11)
-            return False
-        keycode = x11.XKeysymToKeycode(ctypes.c_void_p(self.display), ctypes.c_ulong(keysym))
-        if not keycode:
-            self._close(x11)
-            return False
-
+        x11, keycode, masks = prepared
         self.root_window = x11.XDefaultRootWindow(ctypes.c_void_p(self.display))
-        self.keycode = int(keycode)
-        self.masks = [mods | extra for extra in _HOTKEY_LOCK_MASKS]
-        # 抓的时候把 X 的默认错误处理器换掉：键被别的程序占了是 BadAccess，
-        # 默认处理器会直接把进程打掉，必须自己收下这次错误。
-        failed = []
-        handler = self._handler_type(lambda display, event: failed.append(True) or 0)
-        self._handler = handler                    # 别让回调被回收
-        previous = x11.XSetErrorHandler(ctypes.cast(handler, ctypes.c_void_p))
-        try:
-            for mask in self.masks:
-                x11.XGrabKey(ctypes.c_void_p(self.display), ctypes.c_int(self.keycode),
-                             ctypes.c_uint(mask), ctypes.c_ulong(self.root_window),
-                             ctypes.c_int(0), ctypes.c_int(self.GRAB_MODE_ASYNC),
-                             ctypes.c_int(self.GRAB_MODE_ASYNC))
-            x11.XSync(ctypes.c_void_p(self.display), ctypes.c_int(0))
-        finally:
-            x11.XSetErrorHandler(previous)
-        if failed:
+        self.keycode = keycode
+        self.masks = masks
+        if not self._grab(x11, self.keycode, self.masks, self.root_window):
+            self.last_error = "occupied"
             self.remove()
             self._close(x11)
             return False
@@ -666,6 +644,75 @@ class X11Hotkey(object):
         self.spec = spec
         self.job = (root, root.after(self.POLL_MS, self._poll, root))
         return True
+
+    def probe(self, spec):
+        """只试抓一次、立刻放开：返回 (能否抓到, 失败原因代码)。
+
+        给 --doctor 用：不依赖 Tk、不长期占键（X 客户端退出时本来也会释放）。
+        「抓不到」有两种正常解释：本程序已经在运行（键被它占着），或别的程序占着。
+        """
+        prepared = self._prepare(spec)
+        if prepared is None:
+            return False, self.last_error
+        x11, keycode, masks = prepared
+        root_window = x11.XDefaultRootWindow(ctypes.c_void_p(self.display))
+        ok = self._grab(x11, keycode, masks, root_window)
+        if ok:
+            for mask in masks:
+                try:
+                    x11.XUngrabKey(ctypes.c_void_p(self.display), ctypes.c_int(keycode),
+                                   ctypes.c_uint(mask), ctypes.c_ulong(root_window))
+                except Exception:
+                    pass
+            try:
+                x11.XSync(ctypes.c_void_p(self.display), ctypes.c_int(0))
+            except Exception:
+                pass
+        self._close(x11)
+        return ok, ("" if ok else "occupied")
+
+    def _prepare(self, spec):
+        """解析键名 + 连 X + 算键码；失败时写 last_error 并返回 None。"""
+        self.last_error = ""
+        parsed = parse_hotkey(spec)
+        if parsed is None:
+            self.last_error = "parse"
+            return None
+        mods, key = parsed
+        x11 = self._open()
+        if x11 is None:
+            self.last_error = "x11"
+            return None
+        keysym = x11.XStringToKeysym(key.encode("ascii"))
+        keycode = 0
+        if keysym:
+            keycode = x11.XKeysymToKeycode(ctypes.c_void_p(self.display), ctypes.c_ulong(keysym))
+        if not keysym or not keycode:
+            # 非拉丁主布局（如纯俄文/纯中文布局）里 XStringToKeysym("t") 能取到 keysym，
+            # 但 XKeysymToKeycode 会返回 0 —— 这时注册必然失败，必须说清是「布局」问题。
+            self.last_error = "layout"
+            self._close(x11)
+            return None
+        return x11, int(keycode), [mods | extra for extra in _HOTKEY_LOCK_MASKS]
+
+    def _grab(self, x11, keycode, masks, root_window):
+        """抓根窗口；BadAccess（键被别的程序占了）返回 False，不抛异常。"""
+        # 抓的时候把 X 的默认错误处理器换掉：键被别的程序占了是 BadAccess，
+        # 默认处理器会直接把进程打掉，必须自己收下这次错误。
+        failed = []
+        handler = self._handler_type(lambda display, event: failed.append(True) or 0)
+        self._handler = handler                    # 别让回调被回收
+        previous = x11.XSetErrorHandler(ctypes.cast(handler, ctypes.c_void_p))
+        try:
+            for mask in masks:
+                x11.XGrabKey(ctypes.c_void_p(self.display), ctypes.c_int(keycode),
+                             ctypes.c_uint(mask), ctypes.c_ulong(root_window),
+                             ctypes.c_int(0), ctypes.c_int(self.GRAB_MODE_ASYNC),
+                             ctypes.c_int(self.GRAB_MODE_ASYNC))
+            x11.XSync(ctypes.c_void_p(self.display), ctypes.c_int(0))
+        finally:
+            x11.XSetErrorHandler(previous)
+        return not failed
 
     def remove(self):
         """注销（幂等）：先撤 after 任务，再解抓、关连接。"""
@@ -947,13 +994,25 @@ _HOTKEY = None
 
 
 def hotkey_install(root, spec, callback):
-    """注册全局快捷键（按下时调用 callback()）；成功返回 True。"""
+    """注册全局快捷键（按下时调用 callback()）；返回 (成功?, 失败原因代码)。"""
     global _HOTKEY
     hotkey = X11Hotkey()
     if hotkey.install(root, spec, callback):
         _HOTKEY = hotkey
-        return True
-    return False
+        return True, ""
+    return False, hotkey.last_error
+
+
+def hotkey_error_text(code):
+    """把注册失败的原因代码翻成人话（界面提示与 --doctor 共用）。"""
+    return {
+        "parse": tr("快捷键写法认不出", "cannot parse the hotkey name"),
+        "x11": tr("连不上 X11（没有 DISPLAY 或缺 libX11）",
+                  "cannot connect to X11 (no DISPLAY or libX11 missing)"),
+        "layout": tr("当前键盘布局里没有这个键（换回英文布局或换键）",
+                     "the current keyboard layout has no such key (switch to a Latin layout or change the hotkey)"),
+        "occupied": tr("这个键已被其它程序占用", "the key is grabbed by another program"),
+    }.get(code or "", tr("原因未知", "unknown reason"))
 
 
 def hotkey_remove():
@@ -1140,7 +1199,9 @@ class Store(object):
         self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94,
                    "topmost": False, "hotkey": HOTKEY_DEFAULT,
                    "width": None, "height": None, "done_collapsed": False,
-                   "sound": True}
+                   "sound": True,
+                   # 只表示「用户对开机自启表过态」：关掉后不再被默认打开（v0.5.1）
+                   "autostart_decided": False}
         self.archive = []                 # 归档：完成的（过 00:00）/ 清掉的 / 删掉的都进这里
         self._next_id = 1
         self.load_error = None            # 读取被拒绝的原因（例如数据来自更新版本）
@@ -1252,6 +1313,8 @@ class Store(object):
                 self.ui["topmost"] = ui["topmost"]
             if isinstance(ui.get("sound"), bool):
                 self.ui["sound"] = ui["sound"]
+            if isinstance(ui.get("autostart_decided"), bool):
+                self.ui["autostart_decided"] = ui["autostart_decided"]
             hotkey = ui.get("hotkey")
             if isinstance(hotkey, str) and parse_hotkey(hotkey) is not None:
                 self.ui["hotkey"] = hotkey
@@ -2702,6 +2765,9 @@ class TodoWindow(object):
         self._expanded_size = None
         self._hotkey_spec = store.ui.get("hotkey") or HOTKEY_DEFAULT
         self._hotkey_on = False
+        self._hotkey_error = ""
+        self._hotkey_warn_on = False
+        self._hotkey_retry_job = None
         self._archived_day = None
 
         self._migrate_ui()
@@ -2714,6 +2780,7 @@ class TodoWindow(object):
         if visible:
             win.show_all()
             win.present()
+            self._default_autostart_once()
             self._apply_collapsed()
             self._restore_geometry()
             single_instance_start(self.root, self.raise_window, self.add_from_ipc)
@@ -2721,9 +2788,20 @@ class TodoWindow(object):
             if session_kind()[0] == "wayland":
                 # 纯 Wayland 下 XGrabKey 不可用：不注册，也不假装成功（界面上已有说明）
                 self._hotkey_on = False
+                write_diag("hotkey 注册=跳过（Wayland 会话）")
             else:
-                self._hotkey_on = hotkey_install(self.root, self._hotkey_spec,
-                                                 self.raise_window)
+                self._hotkey_on, self._hotkey_error = hotkey_install(
+                    self.root, self._hotkey_spec, self.raise_window)
+                if self._hotkey_on:
+                    write_diag("hotkey 注册=成功 spec=%s"
+                               % format_hotkey(self._hotkey_spec))
+                else:
+                    # 不能静默失败：注册不上时用户按键没反应，会以为「快捷键坏了」。
+                    write_diag("hotkey 注册=失败 spec=%s 原因=%s"
+                               % (format_hotkey(self._hotkey_spec),
+                                  hotkey_error_text(self._hotkey_error)))
+                    self._show_hotkey_warn()
+                    self._schedule_hotkey_retry()
             self._remind_tick(raise_it=False)
 
     def _migrate_ui(self):
@@ -2777,7 +2855,7 @@ class TodoWindow(object):
         set_window_opacity(win, float(self.store.ui.get("alpha") or 0.94))
         win.set_resizable(True)
         win.set_default_size(self.panel_w, 420)
-        win.connect("delete-event", lambda *_a: self.quit())
+        win.connect("delete-event", self._on_delete_event)
         win.connect("destroy", lambda *_a: self.quit())
         win.connect("key-press-event", self._on_window_key)
 
@@ -2809,13 +2887,102 @@ class TodoWindow(object):
         kind, _detail = session_kind()
         self._session_warn_on = kind in ("wayland", "xwayland")
         if not self._session_warn_on:
+            self._sync_warn_visibility()
             return
         if kind == "wayland":
             text = "Wayland 会话：全局快捷键 / 置顶可能不可用（本程序为 X11 设计）"
         else:
             text = "Wayland 会话（XWayland）：唤回 / 置顶可能不稳定"
         self.session_warn.set_text(text)
-        self.session_warn.show()
+        self._sync_warn_visibility()
+
+    # ---- 全局快捷键注册失败的可见化（v0.5.1：不再静默） ----
+    HOTKEY_RETRY_MS = 15000
+
+    def _show_hotkey_warn(self):
+        """注册失败时在窗口里给一行提示：用户按了没反应，必须能看见原因。"""
+        self._hotkey_warn_on = True
+        self.session_warn.set_text(tr(
+            "全局快捷键 %s 没注册上（%s）；唤回请用启动器或再运行一次",
+            "Global hotkey %s is not registered (%s); recall via the launcher or by running it again")
+            % (format_hotkey(self._hotkey_spec), hotkey_error_text(self._hotkey_error)))
+        self._sync_warn_visibility()
+
+    def _hide_hotkey_warn(self):
+        self._hotkey_warn_on = False
+        if getattr(self, "_session_warn_on", False):
+            self._apply_session_warn()
+        else:
+            self.session_warn.hide()
+
+    def _sync_warn_visibility(self):
+        """会话提示 / 快捷键提示共用一行：折叠时收起，展开且有内容时显示。"""
+        if bool(self.store.ui.get("collapsed")):
+            self.session_warn.hide()
+            return
+        if getattr(self, "_session_warn_on", False) or self._hotkey_warn_on:
+            self.session_warn.show()
+        else:
+            self.session_warn.hide()
+
+    def _schedule_hotkey_retry(self):
+        """键可能只是「启动时被别的程序临时占着」：隔一会儿再试一次，自愈。"""
+        if self._hotkey_retry_job is not None:
+            return
+        try:
+            self._hotkey_retry_job = GLib.timeout_add(self.HOTKEY_RETRY_MS,
+                                                      self._retry_hotkey)
+        except Exception:
+            self._hotkey_retry_job = None
+
+    def _retry_hotkey(self):
+        self._hotkey_retry_job = None
+        if self._hotkey_on or session_kind()[0] == "wayland":
+            return False
+        ok, reason = hotkey_install(self.root, self._hotkey_spec, self.raise_window)
+        if ok:
+            self._hotkey_on = True
+            self._hotkey_error = ""
+            self._hide_hotkey_warn()
+            write_diag("hotkey 重试注册=成功 spec=%s"
+                       % format_hotkey(self._hotkey_spec))
+            return False
+        self._hotkey_error = reason
+        return True
+
+    def _cancel_hotkey_retry(self):
+        if self._hotkey_retry_job is None:
+            return
+        job = self._hotkey_retry_job
+        self._hotkey_retry_job = None
+        try:
+            GLib.source_remove(job)
+        except Exception:
+            pass
+
+    def _default_autostart_once(self):
+        """一次性把「开机自启」打开：桌面挂件要常驻，程序没在跑全局快捷键就是死的。
+
+        只在用户从未表态过时做（autostart_decided 置位后不再强加）；想关掉在右键菜单取消。
+        """
+        if self.store.ui.get("autostart_decided"):
+            return
+        self.store.ui["autostart_decided"] = True
+        if not os.path.exists(autostart_path()):
+            try:
+                autostart_install()
+                try:
+                    # 菜单勾选状态同步，但别再触发一次写入（toggled 处理器）
+                    self._autostart_item.handler_block_by_func(self._on_autostart_toggled)
+                    self._autostart_item.set_active(True)
+                    self._autostart_item.handler_unblock_by_func(self._on_autostart_toggled)
+                except Exception:
+                    pass
+                self.flash_hint(tr("已默认开启开机自启（右键菜单可取消）",
+                                   "Start on login is on by default (toggle it in the right-click menu)"))
+            except Exception:
+                pass
+        self.store.save()
 
     def _make_palette(self):
         self.palette = Palette(self.win.get_style_context())
@@ -2860,8 +3027,10 @@ class TodoWindow(object):
 
         self.collapse_btn = icon_button("pan-up-symbolic", 15, tooltip=tr("折叠 / 展开", "Collapse / expand"))
         self.collapse_btn.connect("clicked", lambda _b: self.toggle_collapsed())
-        self.close_btn = icon_button("window-close-symbolic", 15, tooltip=tr("退出", "Quit"))
-        self.close_btn.connect("clicked", lambda _b: self.quit())
+        self.close_btn = icon_button("window-close-symbolic", 15,
+                                     tooltip=tr("收起窗口（Super+T 唤回；退出在右键菜单）",
+                                                "Hide window (recall with Super+T; quit from the right-click menu)"))
+        self.close_btn.connect("clicked", lambda _b: self.hide_window())
         self.header.pack_end(self.close_btn, False, False, 0)
         self.header.pack_end(self.collapse_btn, False, False, 0)
 
@@ -2962,6 +3131,8 @@ class TodoWindow(object):
         self.session_warn.get_style_context().add_class("hint")
         self.session_warn.get_style_context().add_class("warn")
         self.session_warn.set_no_show_all(True)
+        self.session_warn.set_line_wrap(True)
+        self.session_warn.set_max_width_chars(28)
         self.session_warn.hide()
         self.session_warn.set_margin_start(16)
         self.session_warn.set_margin_end(16)
@@ -3801,7 +3972,8 @@ class TodoWindow(object):
                 widget.set_visible(bool(self.filter_query))
             else:
                 widget.show()
-        if collapsed or not getattr(self, "_session_warn_on", False):
+        if collapsed or not (getattr(self, "_session_warn_on", False)
+                             or self._hotkey_warn_on):
             self.session_warn.hide()
         else:
             self.session_warn.show()
@@ -3919,6 +4091,23 @@ class TodoWindow(object):
         else:
             self.raise_window()
 
+    def hide_window(self):
+        """收起窗口（不退出）：只是 hide()，全局快捷键 / 再运行一次都能唤回。"""
+        try:
+            self.win.hide()
+        except Exception:
+            pass
+
+    def _on_delete_event(self, *_args):
+        """窗口「×」= 收起，不是退出（v0.5.1 起）。
+
+        0.5.0 及以前「×」直接 quit()：桌面挂件没有托盘、全局快捷键是唯一的常驻唤回入口，
+        用户点一下 × 再按 Super+T 就永远没反应 —— 首条商店评论「super+t不好用啊」的坑。
+        真正退出在标题栏右键菜单 →「退出」。
+        """
+        self.hide_window()
+        return True
+
     def _on_sound_toggled(self, item):
         self.store.ui["sound"] = bool(item.get_active())
         self.store.save()
@@ -3935,6 +4124,9 @@ class TodoWindow(object):
             autostart_install()
         else:
             autostart_uninstall()
+        # 用户手动表过态：以后不再被「首次运行默认开自启」强行打开
+        self.store.ui["autostart_decided"] = True
+        self.store.save()
         self._autostart_item.set_active(os.path.exists(autostart_path()))
         self.flash_hint(tr("开机自启：%s", "Start on login: %s")
                         % tr("已开启", "on") if want else
@@ -4403,6 +4595,7 @@ class TodoWindow(object):
             pass
         self._remind_stop()
         self._cancel_regroup()
+        self._cancel_hotkey_retry()
         hotkey_remove()
         single_instance_stop(self.root)
         self.store.resort()
@@ -4838,6 +5031,19 @@ def run_check():
                             % (format_hotkey("super+t"), format_hotkey("ctrl+alt+k")))
         if parse_hotkey("Super+T") != parse_hotkey("super-t"):
             problems.append("快捷键对大小写和连字符应当等价")
+        # v0.5.1：注册失败要说清原因，--doctor 要能真抓一次键
+        for code in ("parse", "x11", "layout", "occupied", "怪东西"):
+            if not hotkey_error_text(code):
+                problems.append("快捷键失败原因没有文案: %r" % (code,))
+        first_ok, first_code = X11Hotkey().probe(HOTKEY_DEFAULT)
+        if first_ok and first_code:
+            problems.append("试抓成功却带着失败原因: %r" % (first_code,))
+        elif not first_ok and first_code not in ("occupied", "x11", "layout"):
+            problems.append("试抓失败的未知原因: %r" % (first_code,))
+        second_ok, _second_code = X11Hotkey().probe(HOTKEY_DEFAULT)
+        if second_ok != first_ok:
+            problems.append("试抓探针没有把键放开（第一次 %r，第二次 %r）"
+                            % (first_ok, second_ok))
 
         # ---- 子步骤 ----
         subs = Store(os.path.join(temp_dir, "steps.json"))
@@ -5110,6 +5316,11 @@ def run_check():
             win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
             app = TodoWindow(win, ui_store, visible=False)
             app.render(keep_scroll=False)
+            # v0.5.1：「×」只收起、不退出（退出在右键菜单）。delete-event 必须被吃掉。
+            if app._on_delete_event(win, None) is not True:
+                problems.append("窗口 × 没有吃掉 delete-event（会把程序退出）")
+            if getattr(app, "_quitting", False):
+                problems.append("窗口 × 把程序退出了（应当只收起）")
             if len(app.row_widgets) != 3:
                 problems.append("界面没把 3 条都排出来: %r" % (len(app.row_widgets),))
             if tr("3 项未完成", "3 unfinished") not in app.count.get_text():
@@ -5515,8 +5726,41 @@ def run_doctor():
     else:
         row("libX11", "OK", "libX11.so.6")
 
-    hotkey_ok = parse_hotkey(HOTKEY_DEFAULT) is not None
-    row(tr("快捷键解析", "hotkey parsing"), "OK" if hotkey_ok else "FAIL", HOTKEY_DEFAULT)
+    # 快捷键：解析 + **真抓一次键**（v0.5.1 起；0.5.0 只验证了键名字符串，键被占也全绿）
+    try:
+        configured = Store(data_file()).ui.get("hotkey") or HOTKEY_DEFAULT
+    except Exception:
+        configured = HOTKEY_DEFAULT
+    configured = format_hotkey(configured)
+    kind, _kind_detail = session_kind()
+    hotkey_ok = parse_hotkey(configured) is not None
+    row(tr("快捷键解析", "hotkey parsing"), "OK" if hotkey_ok else "FAIL", configured)
+    if _x11_load() is None:
+        row(tr("全局快捷键", "global hotkey"), "FAIL",
+            tr("libX11 载入失败，注册不了", "cannot load libX11; cannot register"))
+    elif kind == "wayland":
+        row(tr("全局快捷键", "global hotkey"), "N/A",
+            tr("Wayland 会话：不使用 X11 全局抓键（%s 不可用）",
+               "Wayland session: no X11 key grab (%s unavailable)") % configured)
+    else:
+        running = os.path.exists(ipc_socket_path())
+        grabbed, code = X11Hotkey().probe(configured)
+        if running and grabbed:
+            row(tr("全局快捷键", "global hotkey"), "WARN",
+                tr("程序在运行，但 %s 没被它抓住：可能被别的程序占用了",
+                   "the program is running but does not hold %s: another program may have grabbed it") % configured)
+        elif running:
+            row(tr("全局快捷键", "global hotkey"), "OK",
+                tr("%s 由正在运行的实例持有（正常）",
+                   "%s is held by the running instance (normal)") % configured)
+        elif grabbed:
+            row(tr("全局快捷键", "global hotkey"), "OK",
+                tr("%s 当前可抓取（程序未运行，启动后会注册）",
+                   "%s is currently grabbable (program not running; registers on start)") % configured)
+        else:
+            row(tr("全局快捷键", "global hotkey"), "WARN",
+                tr("%s 抓不到：%s；启动本程序时会注册失败",
+                   "%s cannot be grabbed: %s; registration will fail on start") % (configured, hotkey_error_text(code)))
 
     path = data_file()
     row(tr("数据文件", "data file"), "OK" if os.path.exists(path) else "WARN",
